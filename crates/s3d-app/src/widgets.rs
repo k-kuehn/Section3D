@@ -181,3 +181,16 @@ pub fn weak(ui: &Ui, text: impl Into<String>) -> RichText {
 pub fn palette_color_for_status(p: &Palette, ok: bool, warn: bool) -> Color32 {
     if !ok { p.bad } else if warn { p.warn } else { p.good }
 }
+
+/// Framed on/off button (toolbar style).
+pub fn toggle_button(ui: &mut Ui, on: &mut bool, text: &str) -> Response {
+    let p = theme::ui_palette(ui);
+    let label = RichText::new(text).color(if *on { p.accent_text } else { p.text });
+    let b = egui::Button::new(label).fill(if *on { p.accent } else { p.field }).stroke(Stroke::new(1.0, if *on { p.accent } else { p.field_stroke })).corner_radius(CornerRadius::same(6));
+    let mut r = ui.add(b);
+    if r.clicked() {
+        *on = !*on;
+        r.mark_changed();
+    }
+    r
+}

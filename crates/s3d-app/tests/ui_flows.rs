@@ -200,3 +200,20 @@ fn connectors_export_undo_project_flow() {
     assert_eq!(doc.status(Step::Split), s3d_app::doc::Status::Done, "opening never re-cuts");
     let _ = std::fs::remove_dir_all(&out);
 }
+
+#[test]
+fn light_theme_and_help() {
+    let mut h = harness();
+    h.run_steps(2);
+    h.state_mut().start_import(sample_model());
+    wait_jobs(&mut h);
+    h.state_mut().dark = false;
+    s3d_app::theme::apply(&h.ctx, false);
+    h.state_mut().step = Step::Prepare;
+    h.run_steps(3);
+    shot(&mut h, "20_light_prepare");
+    // Every help marker id used in the UI has a help entry.
+    for id in s3d_app::tooltips::IDS {
+        assert!(s3d_app::tooltips::get(id).is_some(), "{id}");
+    }
+}

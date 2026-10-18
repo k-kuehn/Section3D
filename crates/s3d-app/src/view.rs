@@ -416,11 +416,11 @@ fn toolbar(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
             }
         } else {
             ui.add_enabled_ui(has_split, |ui| {
-                ui.toggle_value(&mut v.show_planes, "Cut planes").on_hover_text("Show the cut planes faintly");
+                widgets::toggle_button(ui, &mut v.show_planes, "Cut planes").on_hover_text("Show the cut planes faintly");
                 ui.label(widgets::weak(ui, "Explode"));
                 ui.add(egui::Slider::new(&mut v.explode, 0.0..=1.0).show_value(false));
             });
-            ui.toggle_value(&mut v.section, "Section").on_hover_text("Cut the view open along an axis");
+            widgets::toggle_button(ui, &mut v.section, "Section").on_hover_text("Cut the view open along an axis");
             if v.section {
                 let r = egui::ComboBox::from_id_salt("secaxis").width(44.0).selected_text(["X", "Y", "Z"][v.section_axis]).show_ui(ui, |ui| {
                     for (i, a) in ["X", "Y", "Z"].iter().enumerate() {
@@ -430,7 +430,7 @@ fn toolbar(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
                 r.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Section axis"));
                 ui.add(egui::Slider::new(&mut v.section_pos, 0.0..=1.0).show_value(false));
             }
-            if ui.toggle_value(&mut v.measure, "Measure").on_hover_text("Click two points to measure").changed() {
+            if widgets::toggle_button(ui, &mut v.measure, "Measure").on_hover_text("Click two points to measure").changed() {
                 v.measure_pts.clear();
             }
         }
@@ -584,7 +584,8 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     if scene_bb.is_empty() {
         scene_bb = Aabb { min: Vec3::splat(-100.0), max: Vec3::splat(100.0) };
     }
-    ground_and_printer(&mut frame, &scene_bb, &app.doc, p);
+    let printer_bb = ground_and_printer(&mut frame, &scene_bb, &app.doc, p);
+    let fit_bb = scene_bb.union(&printer_bb);
 
     // Section plane.
     if app.view.section && app.view.tab == Tab::Model {
@@ -623,7 +624,7 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     };
     if app.view.viewport.pending_fit || !app.view.fitted_once {
         let aspect = app.view.viewport.aspect();
-        app.view.viewport.camera.fit(&scene_bb, aspect);
+        app.view.viewport.camera.fit(&fit_bb, aspect);
         app.view.viewport.pending_fit = false;
         app.view.fitted_once = true;
     }
@@ -846,7 +847,8 @@ fn plane_outline(frame: &mut SceneFrame, pl: Plane, c: Vec3, size: f32, color: [
 }
 
 /// Ground grid under the model and a wireframe of the printer's build volume.
-fn ground_and_printer(frame: &mut SceneFrame, bb: &Aabb, doc: &Document, p: &Palette) {
+/// Returns the bounds of the build-volume box (included when fitting the view).
+fn ground_and_printer(frame: &mut SceneFrame, bb: &Aabb, doc: &Document, p: &Palette) -> Aabb {
     let ext = bb.size().x.max(bb.size().y).max(200.0) * 0.75 + 50.0;
     let step = [10.0f32, 25.0, 50.0, 100.0, 250.0, 500.0].into_iter().find(|s| ext / s < 14.0).unwrap_or(1000.0);
     let n = (ext / step).ceil() as i32;
@@ -868,6 +870,7 @@ fn ground_and_printer(frame: &mut SceneFrame, bb: &Aabb, doc: &Document, p: &Pal
         frame.lines.push(LineSeg::new(corner(a), corner(b), pc, 1.5));
     }
     frame.tris.extend([0usize, 1, 3, 0, 3, 2].iter().map(|&i| TriVert { pos: (corner(i) + Vec3::Z * 0.1).into(), color: [pc[0], pc[1], pc[2], 0.10] }));
+    Aabb { min: o, max: o + s }
 }
 
 /// 2D overlays drawn by egui on top of the 3D image: labels, measure text.
