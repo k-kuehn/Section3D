@@ -1,3 +1,7 @@
 [env]
 # CMake ships with the Visual Studio Build Tools; used only to build vendored Manifold.
 CMAKE = { value = "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe", force = false }
+
+# Static C runtime: section3d.exe runs without the Visual C++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
