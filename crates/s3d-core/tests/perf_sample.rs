@@ -38,3 +38,23 @@ fn sample_diagnostics() {
     let t = Instant::now();
     eprintln!("volume {} in {:?}", mesh.volume(), t.elapsed());
 }
+
+#[test]
+fn grid_split_sample() {
+    let Some(path) = sample() else { return };
+    let mesh = s3d_core::io::load(&path).unwrap();
+    let mesh = s3d_core::repair::repair(mesh, &JobCtx::new()).unwrap().mesh;
+    let mut settings = s3d_core::settings::Settings::default();
+    settings.printer.printer = s3d_core::printers::Printer::new("X1C", 256.0, 256.0, 256.0);
+    settings.split.mode = s3d_core::settings::SplitMode::Grid;
+    let t = Instant::now();
+    let job = JobCtx::new();
+    let out = s3d_core::split::run(
+        s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings, zones: Default::default(), edits: vec![], keep: vec![] },
+        &job,
+    )
+    .unwrap();
+    let p = &out.partition;
+    let flagged = p.pieces.iter().filter(|q| !q.flags.is_empty()).count();
+    eprintln!("grid: {} pieces, {} seams, {} flagged, in {:?}", p.pieces.len(), p.seams.len(), flagged, t.elapsed());
+}

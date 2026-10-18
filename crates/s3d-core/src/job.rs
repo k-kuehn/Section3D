@@ -15,6 +15,7 @@ struct Inner {
     /// Progress in 1/10000ths.
     progress: AtomicU32,
     stage: std::sync::Mutex<String>,
+    timer: std::sync::Mutex<Option<(String, std::time::Instant)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +49,16 @@ impl JobCtx {
         self.inner.progress.load(Ordering::Relaxed) as f32 / 10000.0
     }
     pub fn set_stage(&self, stage: impl Into<String>) {
-        *self.inner.stage.lock().unwrap() = stage.into();
+        let stage = stage.into();
+        if std::env::var_os("S3D_TIMING").is_some() {
+            let mut t = self.inner.timer.lock().unwrap();
+            let now = std::time::Instant::now();
+            if let Some((prev, at)) = t.take() {
+                eprintln!("[timing] {prev}: {:?}", now - at);
+            }
+            *t = Some((stage.clone(), now));
+        }
+        *self.inner.stage.lock().unwrap() = stage;
     }
     pub fn stage(&self) -> String {
         self.inner.stage.lock().unwrap().clone()
