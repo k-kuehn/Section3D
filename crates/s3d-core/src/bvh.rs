@@ -147,11 +147,28 @@ impl Bvh {
         count
     }
 
-    /// Inside test for closed meshes: majority vote of parity along 3 skewed rays.
+    /// Inside test for closed meshes: majority vote of crossing parity along
+    /// five rays in "irrational" directions, so rays from grid points do not
+    /// run exactly through the edges of axis-aligned faces.
     pub fn contains(&self, p: Vec3) -> bool {
-        const DIRS: [Vec3; 3] = [Vec3::new(0.5773, 0.5774, 0.5773), Vec3::new(-0.7071, 0.0012, 0.7071), Vec3::new(0.0013, -0.8, -0.6)];
-        let votes = DIRS.iter().filter(|d| self.ray_crossings(p, **d) % 2 == 1).count();
-        votes >= 2
+        const DIRS: [Vec3; 5] = [
+            Vec3::new(0.412_31, 0.537_93, 0.735_36),
+            Vec3::new(-0.681_17, 0.215_39, 0.699_76),
+            Vec3::new(0.193_07, -0.887_93, -0.417_52),
+            Vec3::new(-0.315_83, -0.392_61, 0.863_77),
+            Vec3::new(0.788_42, 0.317_05, -0.527_13),
+        ];
+        let mut inside = 0;
+        for (i, d) in DIRS.iter().enumerate() {
+            if self.ray_crossings(p, d.normalize()) % 2 == 1 {
+                inside += 1;
+            }
+            let outside = i + 1 - inside;
+            if inside >= 3 || outside >= 3 {
+                break;
+            }
+        }
+        inside >= 3
     }
 
     /// Closest point on the surface within `max_dist`: (distance, point, tri).

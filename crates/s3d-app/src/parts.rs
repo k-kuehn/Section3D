@@ -238,8 +238,11 @@ pub fn selected_card(app: &mut S3dApp, ui: &mut Ui) {
                 .horizontal(|ui| {
                     let mut pd = pending.unwrap_or(PendingSeam { seam: s.id, offset: 0.0, tilt: 0.0 });
                     let lbl = ui.label(RichText::new(format!("↔ #{other}")).color(p.text_strong)).on_hover_text(format!("Cut shared with piece #{other} ({:.0} cm²)", s.area / 100.0));
-                    if s.locked {
-                        ui.label("🔒");
+                    let lock = ui.add_enabled(!busy, egui::Button::new(if s.locked { "🔒" } else { "🔓" }).small()).on_hover_text(if s.locked { "Unlock this cut" } else { "Lock this cut: it and the two pieces on either side never change" });
+                    if lock.clicked() {
+                        if let Some(r) = SeamRef::of(part, s.id) {
+                            app.start_edit(EditOp::LockSeam { seam: r, locked: !s.locked });
+                        }
                     }
                     ui.label(widgets::weak(ui, "move"));
                     let r1 = ui.add(egui::DragValue::new(&mut pd.offset).speed(0.5).suffix(" mm").range(-500.0..=500.0));

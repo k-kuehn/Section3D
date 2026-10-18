@@ -24,6 +24,7 @@ pub const IDS: &[&str] = &[
     "split.overhang",
     "split.side_angle",
     "split.time_limit",
+    "split.zones",
     "conn.dowels",
     "conn.diameter",
     "conn.clearance",
@@ -60,6 +61,7 @@ pub fn get(id: &str) -> Option<Help> {
         "split.overhang" => h("Overhang limit", "Surfaces that lean further than this from vertical need support. 45° suits most printers.", d_overhang),
         "split.side_angle" => h("Side angle", "Angle of the two side cuts of each triangle. 45° keeps pieces low and support-free.", d_side_angle),
         "split.time_limit" => h("Search time", "How long Triangle mode keeps improving the layout. A first result appears within a couple of seconds.", d_time),
+        "split.zones" => h("No-cut zones", "Paint over details that must not be cut, like a face or lettering. Cuts move around painted areas.", d_zones),
         "conn.dowels" => h("Dowel pins", "Adds matching blind holes on both sides of every cut. Glue dowel pins into them to align and strengthen joints.", d_dowel),
         "conn.diameter" => h("Pin diameter", "Diameter of the dowel pins you will use.", d_diameter),
         "conn.clearance" => h("Clearance", "Extra hole size so pins slide in. Increase if pins are too tight.", d_clearance),
@@ -259,6 +261,14 @@ fn d_time(pt: &Painter, r: Rect, p: &Palette) {
     pt.add(Shape::line(pts, Stroke::new(2.0, p.accent)));
     line(pt, r, (0.1, 0.9), (0.9, 0.9), Stroke::new(1.0, p.text_weak));
     text(pt, r, 0.5, 0.97, "time → better layout", p.text_weak);
+}
+
+fn d_zones(pt: &Painter, r: Rect, p: &Palette) {
+    let (f, s) = part(p);
+    poly(pt, r, &[(0.1, 0.2), (0.9, 0.2), (0.9, 0.85), (0.1, 0.85)], f, s);
+    pt.circle(at(r, 0.42, 0.52), 18.0, Color32::from_rgb(64, 140, 255).gamma_multiply(0.45), Stroke::new(1.5, Color32::from_rgb(64, 140, 255)));
+    pt.add(Shape::line(vec![at(r, 0.62, 0.12), at(r, 0.66, 0.4), at(r, 0.75, 0.6), at(r, 0.72, 0.95)], Stroke::new(1.5, p.accent)));
+    text(pt, r, 0.42, 0.52, "keep", p.text_strong);
 }
 
 fn d_dowel(pt: &Painter, r: Rect, p: &Palette) {

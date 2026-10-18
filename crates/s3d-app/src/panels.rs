@@ -264,7 +264,7 @@ fn split(app: &mut S3dApp, ui: &mut Ui) {
         ui.add_space(4.0);
         // No-cut zone painting.
         ui.horizontal(|ui| {
-            widgets::field_label(ui, "No-cut zones", "split.mode");
+            widgets::field_label(ui, "No-cut zones", "split.zones");
         });
         ui.horizontal(|ui| {
             let mut on = app.view.paint;

@@ -250,6 +250,7 @@ impl S3dApp {
             if conn.is_some() {
                 s3d_core::connectors::finish(&mut partition, &touched, &settings, job)?;
             }
+            s3d_core::split::flag_assembly(&mut partition);
             edits.push(op);
             status.push(st);
             Ok(JobOut::Updated { partition, edits, status, conn_key: conn, changed: touched, pin_advice: None })

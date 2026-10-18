@@ -90,7 +90,7 @@ pub struct ViewState {
     /// Set when arranging failed, so it is not retried every frame.
     pub arrange_failed: bool,
     pub recovery: Option<std::path::PathBuf>,
-    bvh: HashMap<u64, Arc<Bvh>>,
+    bvh: HashMap<u64, Arc<std::sync::OnceLock<Arc<Bvh>>>>,
     assembly: Option<(u64, Arc<Assembly>)>,
     drag: Option<HandleDrag>,
     bed_drag: Option<(PieceId, egui::Vec2)>,
@@ -255,8 +255,19 @@ impl ViewState {
         }
     }
 
-    fn bvh_for(&mut self, id: u64, mesh: &Arc<Mesh>) -> Arc<Bvh> {
-        self.bvh.entry(id).or_insert_with(|| Arc::new(Bvh::new(mesh))).clone()
+    /// Picking structure for a mesh; built on a worker thread the first time
+    /// it is needed (None until ready) so large models never stall the UI.
+    fn bvh_for(&mut self, id: u64, mesh: &Arc<Mesh>, ctx: &egui::Context) -> Option<Arc<Bvh>> {
+        let slot = self.bvh.entry(id).or_insert_with(|| {
+            let slot: Arc<std::sync::OnceLock<Arc<Bvh>>> = Arc::default();
+            let (s2, m, c) = (slot.clone(), mesh.clone(), ctx.clone());
+            rayon::spawn(move || {
+                let _ = s2.set(Arc::new(Bvh::new(&m)));
+                c.request_repaint();
+            });
+            slot
+        });
+        slot.get().cloned()
     }
 
     fn assembly(&mut self, doc: &Document) -> Option<Arc<Assembly>> {
@@ -335,9 +346,6 @@ pub fn tilt_axis(pl: &Plane) -> DVec3 {
 pub fn show(app: &mut S3dApp, ui: &mut Ui) {
     let p = app.palette();
     app.view.poll_preview(&app.doc, ui.ctx());
-    if app.view.tab == Tab::Beds && app.doc.split.is_some() && !app.jobs.busy() && app.view.arrangement_stale(&app.doc) && !app.view.arrange_failed {
-        app.start_arrange();
-    }
     egui::Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.card_stroke)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         tabs_row(app, ui, &p);
@@ -590,7 +598,8 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     // Interaction.
     let tool_drag = app.view.paint || app.view.drag.is_some() || handle_under_pointer(app, ui);
     let pick_drawn: Vec<(PieceId, u64, Arc<Mesh>, Mat4)> = drawn.iter().map(|d| (d.id, d.mesh_id, d.mesh.clone(), d.model)).collect();
-    let bvhs: Vec<(PieceId, Arc<Bvh>, Mat4)> = pick_drawn.iter().map(|(id, mid, m, model)| (*id, app.view.bvh_for(*mid, m), *model)).collect();
+    let ctx = ui.ctx().clone();
+    let bvhs: Vec<(PieceId, Arc<Bvh>, Mat4)> = pick_drawn.iter().filter_map(|(id, mid, m, model)| Some((*id, app.view.bvh_for(*mid, m, &ctx)?, *model))).collect();
     let clip_plane = frame.clip;
     let pick = |ray: (Vec3, Vec3)| -> Option<(PieceId, Vec3, Vec3)> {
         let mut best: Option<(f32, PieceId, Vec3, Vec3)> = None;
@@ -966,7 +975,14 @@ fn hull(mut pts: Vec<glam::DVec2>) -> Vec<glam::DVec2> {
 fn beds_view(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     let Some(split) = app.doc.split.clone() else { return };
     if app.view.beds.beds.is_empty() {
-        ui.centered_and_justified(|ui| ui.label(widgets::weak(ui, "Press Arrange beds in the Export step.")));
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.4);
+            ui.label(widgets::weak(ui, "Pieces are not arranged on beds yet."));
+            ui.add_space(6.0);
+            if ui.add_enabled(!app.jobs.busy(), egui::Button::new("Arrange beds")).clicked() {
+                app.start_arrange();
+            }
+        });
         return;
     }
     let stale = app.view.beds_key != Some(arrange_key(&app.doc));

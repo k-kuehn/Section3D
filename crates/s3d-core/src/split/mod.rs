@@ -66,6 +66,17 @@ pub fn orient_pieces(p: &mut Partition, ids: &[PieceId], params: &OrientParams) 
     }
 }
 
+/// Flags pieces that cannot slide straight into place during assembly.
+pub fn flag_assembly(p: &mut Partition) {
+    let a = crate::assembly::plan(p);
+    for q in p.pieces.iter_mut() {
+        q.flags.retain(|f| *f != Flag::NoAssemblyPath);
+        if a.blocked.contains(&q.id) {
+            q.flags.push(Flag::NoAssemblyPath);
+        }
+    }
+}
+
 /// Numbers pieces bottom-up, row by row, starting at 1.
 pub fn number_pieces(p: &mut Partition) {
     let mut order: Vec<usize> = (0..p.pieces.len()).collect();
@@ -177,7 +188,7 @@ pub fn run(input: SplitInput, job: &JobCtx) -> Result<SplitOutput, String> {
     orient_pieces(&mut part, &all, &params);
     if s.split.mode == SplitMode::Triangle {
         job.set_stage("Fixing pieces that need support");
-        let budget = std::time::Duration::from_secs_f32((s.split.time_limit * 0.5).clamp(2.0, 60.0));
+        let budget = std::time::Duration::from_secs_f32((s.split.time_limit * 0.15).clamp(1.0, 30.0));
         if fix_flagged(&mut part, &params, budget, job) > 0 {
             cleanup::merge_slivers(&mut part, s.split.min_piece as f64, &params, job).map_err(|e| e.to_string())?;
         }
@@ -193,6 +204,7 @@ pub fn run(input: SplitInput, job: &JobCtx) -> Result<SplitOutput, String> {
         }
     }
     number_pieces(&mut part);
+    flag_assembly(&mut part);
     job.set_stage("Done");
     job.set_progress(1.0);
     Ok(SplitOutput { partition: part, edit_status })
