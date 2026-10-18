@@ -198,21 +198,21 @@ impl Renderer3d {
             Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(write), depth_compare: Some(compare), stencil: Default::default(), bias: Default::default() })
         };
         let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
-        let mesh_vb = [wgpu::VertexBufferLayout { array_stride: 12, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3] }];
-        let line_vb = [wgpu::VertexBufferLayout {
+        let mesh_vb = [Some(wgpu::VertexBufferLayout { array_stride: 12, step_mode: wgpu::VertexStepMode::Vertex, attributes: &wgpu::vertex_attr_array![0 => Float32x3] })];
+        let line_vb = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<LineSeg>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32],
-        }];
-        let tri_vb = [wgpu::VertexBufferLayout {
+        })];
+        let tri_vb = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<TriVert>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
-        }];
+        })];
         let pipe = |label: &str,
                     vs: &str,
                     fs: &str,
-                    vb: &[wgpu::VertexBufferLayout],
+                    vb: &[Option<wgpu::VertexBufferLayout>],
                     blend: Option<wgpu::BlendState>,
                     depth: Option<wgpu::DepthStencilState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

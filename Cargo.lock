@@ -2453,9 +2453,11 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "eframe",
+ "egui",
  "egui-wgpu",
  "egui_kittest",
  "glam",
+ "image",
  "rayon",
  "rfd",
  "s3d-core",

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{DVec2, DVec3, Vec3};
+use glam::{DVec2, Vec3};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 

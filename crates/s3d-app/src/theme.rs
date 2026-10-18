@@ -82,8 +82,16 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts.font_data.insert("inter-semibold".into(), FontData::from_static(include_bytes!("../assets/Inter-600.ttf")).into());
     fonts.font_data.insert("inter-bold".into(), FontData::from_static(include_bytes!("../assets/Inter-700.ttf")).into());
     fonts.font_data.insert("mono".into(), FontData::from_static(include_bytes!("../assets/JetBrainsMono-400.ttf")).into());
+    // Small Noto subsets for UI symbols (see tools/make_symbol_fonts.py).
+    fonts.font_data.insert("symbols".into(), FontData::from_static(include_bytes!("../assets/Symbols.ttf")).into());
+    fonts.font_data.insert("math".into(), FontData::from_static(include_bytes!("../assets/MathSymbols.ttf")).into());
     fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "inter".into());
     fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "mono".into());
+    for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+        let f = fonts.families.get_mut(&fam).unwrap();
+        f.push("symbols".into());
+        f.push("math".into());
+    }
     let fallback: Vec<String> = fonts.families[&FontFamily::Proportional].iter().skip(1).cloned().collect();
     let mut semi = vec!["inter-semibold".to_string()];
     semi.extend(fallback.iter().cloned());

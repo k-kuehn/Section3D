@@ -112,7 +112,7 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
         *on = !*on;
         resp.mark_changed();
     }
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, ""));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *on, ""));
     let t = ui.ctx().animate_bool_responsive(resp.id, *on);
     let off_fill = if p.dark { Color32::from_rgb(0x3A, 0x42, 0x50) } else { Color32::from_rgb(0xC9, 0xD1, 0xDB) };
     let fill = lerp_color(off_fill, p.accent, t);

@@ -45,9 +45,14 @@ impl ZipWriter {
 
     /// Adds a file. `compress` selects deflate (level 6) over storing.
     pub fn add(&mut self, name: &str, data: &[u8], compress: bool) {
+        self.add_level(name, data, if compress { 6 } else { 0 });
+    }
+
+    /// Adds a file with a deflate level (0 = store, 1 = fastest .. 9 = smallest).
+    pub fn add_level(&mut self, name: &str, data: &[u8], level: u8) {
         let crc = crc32(data);
-        let (method, payload) = if compress {
-            let c = miniz_oxide::deflate::compress_to_vec(data, 6);
+        let (method, payload) = if level > 0 {
+            let c = miniz_oxide::deflate::compress_to_vec(data, level);
             if c.len() < data.len() { (8u16, c) } else { (0, data.to_vec()) }
         } else {
             (0, data.to_vec())

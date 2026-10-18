@@ -1,6 +1,7 @@
 //! The Split job: plan cuts, apply them, clean up, replay edits, orient.
 
 pub mod cleanup;
+pub mod fix;
 pub mod grid;
 pub mod triangle;
 

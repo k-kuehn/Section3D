@@ -12,7 +12,6 @@ pub use camera::{Camera, ViewPreset};
 pub use renderer::{DrawItem, LineSeg, MeshRef, SceneFrame, TriVert};
 
 /// What the user did in the viewport this frame.
-#[derive(Default)]
 pub struct ViewportInput {
     /// Primary click (not a drag): world ray.
     pub click: Option<(Vec3, Vec3)>,
@@ -23,6 +22,12 @@ pub struct ViewportInput {
     pub tool_drag: Option<ToolDrag>,
     pub rect: Rect,
     pub response: Option<egui::Response>,
+}
+
+impl Default for ViewportInput {
+    fn default() -> Self {
+        ViewportInput { click: None, right_click: None, hover: None, tool_drag: None, rect: Rect::NOTHING, response: None }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

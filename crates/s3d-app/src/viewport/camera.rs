@@ -38,13 +38,13 @@ impl Camera {
 
     pub fn view(&self) -> Mat4 {
         let up = if self.pitch.abs() > 1.55 { Vec3::new(-self.yaw.cos(), -self.yaw.sin(), 0.0) * self.pitch.signum() } else { Vec3::Z };
-        Mat4::look_at_rh(self.eye(), self.target, up)
+        glam::camera::rh::view::look_at_mat4(self.eye(), self.target, up)
     }
 
     pub fn proj(&self, aspect: f32) -> Mat4 {
         let far = self.distance + self.scene_radius * 4.0;
         let near = (self.distance - self.scene_radius * 2.0).max(far * 1e-4).max(0.5);
-        Mat4::perspective_rh(self.fov_y, aspect.max(1e-3), near, far)
+        glam::camera::rh::proj::directx::perspective(self.fov_y, aspect.max(1e-3), near, far)
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
