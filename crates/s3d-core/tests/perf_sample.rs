@@ -50,7 +50,7 @@ fn grid_split_sample() {
     let t = Instant::now();
     let job = JobCtx::new();
     let out = s3d_core::split::run(
-        s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings, zones: Default::default(), edits: vec![], keep: vec![] },
+        s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings, zones: Default::default(), edits: vec![], keep: vec![], preview: None },
         &job,
     )
     .unwrap();
@@ -78,4 +78,46 @@ fn grid_split_sample() {
     let q = |f: f64| widths[((widths.len() - 1) as f64 * f) as usize];
     eprintln!("suggested pin diameter: {:?}", s3d_core::connectors::suggest_pin_size(&part, &st.connectors));
     eprintln!("seam contact widths mm: min {:.1} p25 {:.1} median {:.1} p75 {:.1} max {:.1}", q(0.0), q(0.25), q(0.5), q(0.75), q(1.0));
+}
+
+#[test]
+fn triangle_split_sample() {
+    let Some(path) = sample() else { return };
+    let mesh = s3d_core::io::load(&path).unwrap();
+    let mesh = s3d_core::repair::repair(mesh, &JobCtx::new()).unwrap().mesh;
+    let mut settings = s3d_core::settings::Settings::default();
+    settings.printer.printer = s3d_core::printers::Printer::new("X1C", 256.0, 256.0, 256.0);
+    settings.split.mode = s3d_core::settings::SplitMode::Triangle;
+    settings.split.time_limit = std::env::var("S3D_TIME").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0);
+    let t = Instant::now();
+    let first = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Duration>));
+    let f2 = first.clone();
+    let t0 = t;
+    let preview: s3d_core::split::triangle::PreviewFn = std::sync::Arc::new(move |edges, msg| {
+        let mut g = f2.lock().unwrap();
+        if g.is_none() {
+            *g = Some(t0.elapsed());
+        }
+        eprintln!("[preview {:?}] {} edges, {}", t0.elapsed(), edges.len(), msg);
+    });
+    let job = JobCtx::new();
+    let out = s3d_core::split::run(
+        s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings, zones: Default::default(), edits: vec![], keep: vec![], preview: Some(preview) },
+        &job,
+    )
+    .unwrap();
+    let p = &out.partition;
+    let mut kinds = std::collections::BTreeMap::new();
+    for q in &p.pieces {
+        for f in &q.flags {
+            *kinds.entry(f.short()).or_insert(0) += 1;
+        }
+    }
+    eprintln!("triangle: {} pieces in {:?}; first preview at {:?}; flags {:?}", p.pieces.len(), t.elapsed(), first.lock().unwrap(), kinds);
+    let mut dims: Vec<f32> = p.pieces.iter().map(|q| q.orient.map(|o| o.size.max_element()).unwrap_or(0.0)).collect();
+    dims.sort_by(|a, b| a.total_cmp(b));
+    let q = |f: f32| dims[((dims.len() - 1) as f32 * f) as usize];
+    eprintln!("piece max dim mm: p10 {:.0} p25 {:.0} median {:.0} p75 {:.0} p90 {:.0}", q(0.1), q(0.25), q(0.5), q(0.75), q(0.9));
+    let area: f64 = p.pieces.iter().map(|q| q.mesh.area()).sum::<f64>() / 2.0;
+    eprintln!("surface area per piece (half of total area): {:.0} mm2", area / p.pieces.len() as f64);
 }

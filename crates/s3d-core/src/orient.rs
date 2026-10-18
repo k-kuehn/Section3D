@@ -11,8 +11,9 @@ use crate::manifold::Solid;
 use crate::mesh::Mesh;
 use crate::partition::{Flag, Orientation};
 
-/// Support areas below this are ignored as scan noise (mm²).
-pub const SUPPORT_NOISE: f32 = 25.0;
+/// Support areas below this are ignored (mm²): tiny overhangs from scan
+/// noise or small bumps bridge fine.
+pub const SUPPORT_NOISE: f32 = 100.0;
 /// Faces this close to the bed rest on it (mm).
 const BED_TOL: f32 = 0.3;
 
@@ -49,7 +50,10 @@ pub fn rest_on(down: DVec3) -> Quat {
 
 /// Area-weighted downward normals of the hull's large flat faces.
 fn hull_faces(mesh: &Mesh, limit: usize) -> Vec<DVec3> {
-    let hull = match Solid::from_mesh(mesh).and_then(|s| s.hull()) {
+    // Hull of the points: works for open meshes too (merge estimates).
+    let step = (mesh.verts.len() / 20_000).max(1);
+    let pts: Vec<DVec3> = mesh.verts.iter().step_by(step).map(|v| v.as_dvec3()).collect();
+    let hull = match Solid::hull_points(&pts) {
         Ok(h) => h.to_mesh(),
         Err(_) => return Vec::new(),
     };

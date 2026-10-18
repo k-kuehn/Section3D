@@ -13,7 +13,8 @@ pub fn flag_color(p: &Palette, f: &Flag) -> Color32 {
     match f {
         Flag::TooBig => p.bad,
         Flag::NeedsSupport(_) => p.bad,
-        Flag::Tall | Flag::Small | Flag::SkippedDowel | Flag::NoAssemblyPath => p.warn,
+        Flag::SkippedDowel => p.info,
+        Flag::Tall | Flag::Small | Flag::NoAssemblyPath => p.warn,
     }
 }
 
@@ -48,14 +49,19 @@ pub fn list(app: &mut S3dApp, ui: &mut Ui) {
     let part = &split.partition;
     let mut order: Vec<usize> = (0..part.pieces.len()).collect();
     // Flagged pieces first, then by label.
-    order.sort_by_key(|&i| (part.pieces[i].flags.is_empty(), part.pieces[i].label));
-    let flagged = part.pieces.iter().filter(|q| !q.flags.is_empty()).count();
+    let rank = |q: &s3d_core::partition::Piece| if q.flags.iter().any(|f| *f != Flag::SkippedDowel) { 0 } else if q.flags.is_empty() { 2 } else { 1 };
+    order.sort_by_key(|&i| (rank(&part.pieces[i]), part.pieces[i].label));
+    let flagged = part.pieces.iter().filter(|q| q.flags.iter().any(|f| *f != Flag::SkippedDowel)).count();
+    let pins = part.pieces.iter().filter(|q| q.flags.contains(&Flag::SkippedDowel)).count();
     card(ui, |ui| {
         ui.horizontal(|ui| {
             section_title(ui, "Parts");
             ui.label(RichText::new(format!("{} pieces", part.pieces.len())).color(p.text_strong));
             if flagged > 0 {
                 widgets::badge(ui, &format!("{flagged} NEED ATTENTION"), p.warn);
+            }
+            if pins > 0 {
+                widgets::badge(ui, &format!("PINS SKIPPED ON {pins}"), p.info).on_hover_text("Walls are too thin for the dowel pins on these pieces. See the Connectors step.");
             }
             widgets::right(ui, |ui| {
                 if !app.view.hidden.is_empty() || app.view.isolate.is_some() {

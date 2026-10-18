@@ -94,6 +94,8 @@ pub struct ViewState {
     bed_drag: Option<(PieceId, egui::Vec2)>,
     footprints: HashMap<u64, Arc<Vec<glam::Vec2>>>,
     fitted_once: bool,
+    /// Cut lines and summary of the Triangle search's current best layout.
+    pub search_preview: Arc<std::sync::Mutex<Option<(Arc<Vec<[Vec3; 2]>>, String)>>>,
     /// Handle screen positions from the last frame, for hit testing.
     handle_screen_positions: std::cell::RefCell<Vec<(SeamId, egui::Pos2, HandleKindTag, Vec3)>>,
 }
@@ -134,6 +136,7 @@ impl Default for ViewState {
             footprints: HashMap::new(),
             fitted_once: false,
             handle_screen_positions: Default::default(),
+            search_preview: Default::default(),
         }
     }
 }
@@ -550,6 +553,14 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
         drawn.push(Drawn { id: u32::MAX, mesh_id: prepared_id, mesh, model: Mat4::IDENTITY });
     }
 
+    // Triangle search in progress: draw the current best layout's cut lines.
+    let searching = app.jobs.current.as_ref().is_some_and(|r| r.kind == crate::jobs::JobKind::Split);
+    if searching && !show_pieces {
+        if let Some((edges, _)) = app.view.search_preview.lock().unwrap().clone() {
+            let c = rgba(p.accent, 1.0);
+            frame.lines.extend(edges.iter().map(|e| LineSeg::new(e[0], e[1], c, 1.6)));
+        }
+    }
     if scene_bb.is_empty() {
         scene_bb = Aabb { min: Vec3::splat(-100.0), max: Vec3::splat(100.0) };
     }
@@ -859,6 +870,11 @@ fn overlays(app: &mut S3dApp, ui: &mut Ui, rect: egui::Rect, p: &Palette) {
     if app.view.paint && app.step == Step::Split {
         painter.text(rect.left_top() + Vec2::new(12.0, 12.0), egui::Align2::LEFT_TOP, "Painting no-cut zones · drag on the model · right-drag to pan", font.clone(), p.accent);
     }
+    if app.jobs.current.as_ref().is_some_and(|r| r.kind == crate::jobs::JobKind::Split) {
+        if let Some((_, msg)) = app.view.search_preview.lock().unwrap().as_ref() {
+            painter.text(rect.left_top() + Vec2::new(14.0, 12.0), egui::Align2::LEFT_TOP, format!("Best layout so far: {msg}"), theme::semibold(14.0), p.text_strong);
+        }
+    }
     // Labels on pieces for the assembly view and when exploded.
     if let Some(split) = &app.doc.split {
         if app.view.tab == Tab::Assembly {
@@ -879,7 +895,8 @@ fn overlays(app: &mut S3dApp, ui: &mut Ui, rect: egui::Rect, p: &Palette) {
                 if app.view.is_hidden(q.id) {
                     continue;
                 }
-                let show = app.view.explode > 0.05 || app.view.selected == Some(q.id) || app.view.hover == Some(q.id);
+                let many = split.partition.pieces.len() > 80;
+                let show = (app.view.explode > 0.05 && !many) || app.view.selected == Some(q.id) || app.view.hover == Some(q.id);
                 if !show {
                     continue;
                 }

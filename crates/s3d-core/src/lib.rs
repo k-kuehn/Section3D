@@ -21,7 +21,9 @@ pub mod printers;
 pub mod project;
 pub mod repair;
 pub mod settings;
+pub mod simplify;
 pub mod split;
+pub mod voxel;
 pub mod zones;
 
 pub use glam;

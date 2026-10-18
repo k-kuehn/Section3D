@@ -150,7 +150,8 @@ fn vs_line(
     let base = select(ca, cb, c.x > 0.5);
     let off = nrm * c.y / (vp * 0.5) * base.w;
     var out: LineOut;
-    out.pos = vec4<f32>(base.xy + off, base.z, base.w);
+    // Pull lines slightly towards the camera so lines on a surface win.
+    out.pos = vec4<f32>(base.xy + off, base.z - 0.0004 * base.w, base.w);
     out.color = color;
     return out;
 }

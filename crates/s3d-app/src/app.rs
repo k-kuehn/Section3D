@@ -178,8 +178,16 @@ impl S3dApp {
         let key = self.doc.split_key();
         let conn_key = self.doc.conn_key();
         let ctx = self.ctx_handle();
+        // Live layout preview while the Triangle search runs.
+        let slot = self.view.search_preview.clone();
+        *slot.lock().unwrap() = None;
+        let repaint = ctx.clone();
+        let preview: s3d_core::split::triangle::PreviewFn = Arc::new(move |edges, msg| {
+            *slot.lock().unwrap() = Some((Arc::new(edges), msg));
+            repaint.request_repaint();
+        });
         self.jobs.start(JobKind::Split, &ctx, move |job| {
-            let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh, settings: settings.clone(), zones, edits, keep }, job)?;
+            let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh, settings: settings.clone(), zones, edits, keep, preview: Some(preview) }, job)?;
             let mut partition = out.partition;
             let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
             s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
@@ -316,7 +324,8 @@ impl S3dApp {
                 st.generation = self.doc.new_id();
                 st.key = self.doc.split_key();
                 let n = st.partition.pieces.len();
-                let flagged = st.partition.pieces.iter().filter(|p| !p.flags.is_empty()).count();
+                let flagged = st.partition.pieces.iter().filter(|p| p.flags.iter().any(|f| *f != s3d_core::partition::Flag::SkippedDowel)).count();
+                let pins_skipped = st.partition.pieces.iter().filter(|p| p.flags.contains(&s3d_core::partition::Flag::SkippedDowel)).count();
                 self.doc.split = Some(Arc::new(st));
                 let orphaned = status.iter().filter(|s| **s != EditStatus::Applied).count();
                 self.doc.edit_status = status;
@@ -326,6 +335,8 @@ impl S3dApp {
                     Notice::Warn(format!("Split into {n} pieces. {orphaned} manual edit(s) could not be re-applied."))
                 } else if flagged > 0 {
                     Notice::Warn(format!("Split into {n} pieces. {flagged} piece(s) need attention."))
+                } else if pins_skipped > 0 {
+                    Notice::Warn(format!("Split into {n} pieces. Pins were skipped on {pins_skipped} piece(s) — see Connectors."))
                 } else {
                     Notice::Info(format!("Split into {n} pieces. All pieces fit and print without supports."))
                 });
@@ -621,7 +632,7 @@ impl S3dApp {
     fn default_status(&self) -> String {
         match &self.doc.split {
             Some(s) => {
-                let flagged = s.partition.pieces.iter().filter(|p| !p.flags.is_empty()).count();
+                let flagged = s.partition.pieces.iter().filter(|p| p.flags.iter().any(|f| *f != s3d_core::partition::Flag::SkippedDowel)).count();
                 if flagged == 0 { format!("{} pieces · no errors or warnings", s.partition.pieces.len()) } else { format!("{} pieces · {flagged} need attention", s.partition.pieces.len()) }
             }
             None => "No errors or warnings".into(),

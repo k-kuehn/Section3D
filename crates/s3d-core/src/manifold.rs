@@ -249,7 +249,7 @@ impl Solid {
             let probe = vm.verts.first().copied().unwrap_or_default();
             let vb = v.bbox();
             // Smallest enclosing shell wins.
-            let host = (0..groups.len())
+            let host = (0..bvhs.len())
                 .filter(|&i| {
                     let b = bvhs[i].bbox();
                     b.min.cmple(vb.min).all() && b.max.cmpge(vb.max).all() && bvhs[i].contains(probe)

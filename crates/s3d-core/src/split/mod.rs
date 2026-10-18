@@ -30,6 +30,8 @@ pub struct SplitInput {
     pub edits: Vec<EditOp>,
     /// Locked pieces carried over unchanged from the previous result.
     pub keep: Vec<Arc<Solid>>,
+    /// Receives the best Triangle layout (as cut lines) while searching.
+    pub preview: Option<triangle::PreviewFn>,
 }
 
 pub struct SplitOutput {
@@ -79,29 +81,70 @@ pub fn number_pieces(p: &mut Partition) {
 }
 
 /// Builds the cut plan for the chosen mode.
-pub fn plan(mesh: &Mesh, s: &Settings, zones: &Zones, job: &JobCtx) -> Plan {
+pub fn plan(mesh: &Mesh, s: &Settings, zones: &Zones, job: &JobCtx, preview: Option<&triangle::PreviewFn>) -> Plan {
     let bed = s.printer.usable();
     let cell = |a: usize| s.split.target_size.map_or(bed[a], |t| t.min(bed[a]));
     match s.split.mode {
         SplitMode::Grid => grid::plan(&mesh.bbox(), [cell(0), cell(1), cell(2)], zones),
-        SplitMode::Triangle => triangle::plan(mesh, s, zones, job),
+        SplitMode::Triangle => triangle::plan(mesh, s, zones, job, preview),
     }
+}
+
+/// Adds a fourth cut to pieces that still do not fit, need support or are
+/// tall (Triangle mode), within a time budget.
+pub fn fix_flagged(part: &mut Partition, params: &OrientParams, budget: std::time::Duration, job: &JobCtx) -> usize {
+    let start = std::time::Instant::now();
+    let mut fixed = 0;
+    let mut tried: Vec<PieceId> = Vec::new();
+    loop {
+        if job.is_cancelled() || start.elapsed() > budget {
+            break;
+        }
+        // Worst first: too big, then most support, then tall.
+        let next = part
+            .pieces
+            .iter()
+            .filter(|q| !q.locked && !tried.contains(&q.id))
+            .filter_map(|q| {
+                let rank = q.flags.iter().map(|f| match f {
+                    Flag::TooBig => 3e9,
+                    Flag::NeedsSupport(a) => 1e6 + *a as f64,
+                    Flag::Tall => 1.0,
+                    _ => 0.0,
+                }).fold(0.0, f64::max);
+                (rank > 0.0).then_some((rank, q.id))
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        let Some((_, id)) = next else { break };
+        tried.push(id);
+        if let Some(plane) = fix::best_cut(part, id, params, job) {
+            if let Ok(ids) = part.split_piece(id, plane) {
+                orient_pieces(part, &ids, params);
+                let mut nb: Vec<PieceId> = ids.iter().flat_map(|i| part.neighbours(*i)).collect();
+                nb.sort_unstable();
+                nb.dedup();
+                orient_pieces(part, &nb, params);
+                fixed += 1;
+            }
+        }
+    }
+    fixed
 }
 
 pub fn run(input: SplitInput, job: &JobCtx) -> Result<SplitOutput, String> {
     let s = &input.settings;
-    job.set_stage("Preparing model");
     job.set_progress(0.02);
-    let mut solid = Solid::from_mesh(&input.mesh).map_err(|e| format!("model is not a valid solid: {e}"))?;
+    // Build the full-resolution solid while the (proxy-based) planning runs.
+    let (solid, plan) = rayon::join(|| Solid::from_mesh(&input.mesh), || {
+        job.set_stage("Planning cuts");
+        plan(&input.mesh, s, &input.zones, job, input.preview.as_ref())
+    });
+    let mut solid = solid.map_err(|e| format!("model is not a valid solid: {e}"))?;
     if !input.keep.is_empty() {
         let refs: Vec<&Solid> = input.keep.iter().map(|k| k.as_ref()).collect();
         let locked = Solid::batch(&refs, crate::manifold::Op::Union).map_err(|e| e.to_string())?;
         solid = solid.subtract(&locked).map_err(|e| e.to_string())?;
     }
-    job.check().map_err(|e| e.to_string())?;
-    job.set_stage("Planning cuts");
-    job.set_progress(0.08);
-    let plan = plan(&input.mesh, s, &input.zones, job);
     job.check().map_err(|e| e.to_string())?;
     job.set_stage("Cutting");
     job.set_progress(0.4);
@@ -132,6 +175,18 @@ pub fn run(input: SplitInput, job: &JobCtx) -> Result<SplitOutput, String> {
     job.set_progress(0.85);
     let all: Vec<PieceId> = part.pieces.iter().map(|q| q.id).collect();
     orient_pieces(&mut part, &all, &params);
+    if s.split.mode == SplitMode::Triangle {
+        job.set_stage("Fixing pieces that need support");
+        let budget = std::time::Duration::from_secs_f32((s.split.time_limit * 0.5).clamp(2.0, 60.0));
+        if fix_flagged(&mut part, &params, budget, job) > 0 {
+            cleanup::merge_slivers(&mut part, s.split.min_piece as f64, &params, job).map_err(|e| e.to_string())?;
+        }
+        // Fold fragments (e.g. at the model's silhouette) into neighbours.
+        job.set_stage("Merging small pieces");
+        let bed = s.printer.usable();
+        let target = s.split.target_size.unwrap_or(bed[0].max(bed[1])) as f64;
+        cleanup::merge_undersized(&mut part, target, 0.55, &params, job).map_err(|e| e.to_string())?;
+    }
     for id in stuck {
         if let Some(q) = part.piece_mut(id) {
             q.flags.push(Flag::Small);
@@ -163,7 +218,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.printer.printer = Printer::new("t", 180.0, 180.0, 180.0);
         settings.split.mode = SplitMode::Grid;
-        let out = run(SplitInput { mesh: mesh.clone(), settings, zones: Zones::default(), edits: vec![], keep: vec![] }, &JobCtx::new()).unwrap();
+        let out = run(SplitInput { mesh: mesh.clone(), settings, zones: Zones::default(), edits: vec![], keep: vec![], preview: None }, &JobCtx::new()).unwrap();
         let p = &out.partition;
         assert!(p.pieces.len() >= 8, "{}", p.pieces.len());
         let v: f64 = p.total_volume();

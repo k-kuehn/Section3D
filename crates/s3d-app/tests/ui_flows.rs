@@ -92,3 +92,40 @@ fn import_split_flow() {
     assert!(h.query_by_label("Update").is_some());
     shot(&mut h, "05_stale");
 }
+
+/// Triangle split of the real sample model (set S3D_SAMPLE), with screenshots.
+#[test]
+fn sample_triangle_screens() {
+    let Some(path) = std::env::var_os("S3D_SAMPLE").map(PathBuf::from).filter(|p| p.exists()) else {
+        eprintln!("S3D_SAMPLE not set; skipping");
+        return;
+    };
+    let mut h = harness();
+    h.run_steps(2);
+    h.state_mut().doc.settings.printer.printer = s3d_core::printers::Printer::new("Bambu Lab X1 Carbon", 256.0, 256.0, 256.0);
+    h.state_mut().start_import(path);
+    wait_jobs(&mut h);
+    shot(&mut h, "s1_imported");
+    h.state_mut().step = Step::Split;
+    h.state_mut().doc.settings.split.mode = s3d_core::settings::SplitMode::Triangle;
+    h.state_mut().doc.settings.split.time_limit = 8.0;
+    h.step();
+    h.get_by_label("Split").click();
+    // Let the search run for a bit and capture the live preview.
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(4) {
+        h.step();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    shot(&mut h, "s2_searching");
+    wait_jobs(&mut h);
+    shot(&mut h, "s3_split");
+    h.state_mut().view.explode = 0.6;
+    h.step();
+    shot(&mut h, "s4_exploded");
+    h.state_mut().view.explode = 0.0;
+    h.state_mut().view.viewport.camera.preset(s3d_app::viewport::ViewPreset::Front);
+    h.state_mut().view.viewport.pending_fit = true;
+    h.step();
+    shot(&mut h, "s5_front");
+}
