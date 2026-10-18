@@ -115,7 +115,9 @@ fn contact_raster(p: &Partition, s: &Seam) -> Option<Contact> {
             d[i] = m;
         }
     }
-    let dist = d.into_iter().map(|c| if c >= big { 0.0 } else { c * cell }).collect();
+    // Centre-to-centre distances overstate the distance to the true edge by
+    // up to half a cell.
+    let dist = d.into_iter().map(|c| if c >= big { 0.0 } else { (c * cell - 0.5 * cell).max(0.0) }).collect();
     let (u, v) = s.plane.basis();
     Some(Contact { u, v, origin, cell, w, h, dist })
 }
@@ -123,15 +125,17 @@ fn contact_raster(p: &Partition, s: &Seam) -> Option<Contact> {
 /// Pin centres for one seam: spread along the contact region's long axis,
 /// kept at least `clear` from its edges and `2 * diameter` apart.
 pub fn place_pins(p: &Partition, s: &Seam, c: &ConnectorSettings) -> Vec<DVec3> {
-    place_pins_checked(p, s, c, &|_| true)
+    place_pins_checked(p, s, c, s.plane.normal, &|_| true)
 }
 
 /// Like `place_pins`, but each pin must pass `fits` (the 3D wall check); the
 /// best few candidate spots per pin are tried in order.
-pub fn place_pins_checked(p: &Partition, s: &Seam, c: &ConnectorSettings, fits: &(dyn Fn(DVec3) -> bool + Sync)) -> Vec<DVec3> {
+pub fn place_pins_checked(p: &Partition, s: &Seam, c: &ConnectorSettings, axis: DVec3, fits: &(dyn Fn(DVec3) -> bool + Sync)) -> Vec<DVec3> {
     let Some(ct) = contact_raster(p, s) else { return Vec::new() };
     let r = c.hole_radius();
-    let clear = r + MIN_WALL;
+    // A tilted hole meets the face in an ellipse with semi-axis r / cos.
+    let cos = axis.normalize().dot(s.plane.normal).abs().max(0.3);
+    let clear = r / cos + MIN_WALL;
     let ok: Vec<(DVec2, f64)> = (0..ct.w * ct.h)
         .filter(|&i| ct.dist[i] >= clear)
         .map(|i| (ct.origin + DVec2::new((i % ct.w) as f64 + 0.5, (i / ct.w) as f64 + 0.5) * ct.cell, ct.dist[i]))
@@ -192,14 +196,20 @@ pub fn place_pins_checked(p: &Partition, s: &Seam, c: &ConnectorSettings, fits: 
 }
 
 /// Checks that a hole going `depth` into the piece along `into` keeps a wall
-/// of `MIN_WALL` everywhere. `bvh` excludes the cut face itself.
-fn hole_fits(bvh: &Bvh, center: DVec3, into: DVec3, r: f64, depth: f64) -> bool {
+/// of `MIN_WALL` to every surface except the cut face it starts on (`face`),
+/// including the piece's other cut faces. `up` is the piece's print "up":
+/// sideways holes get a teardrop tip pointing that way, which is checked too.
+fn hole_fits(bvh: &Bvh, center: DVec3, into: DVec3, r: f64, depth: f64, face: &Plane, up: DVec3) -> bool {
     let need = (r + MIN_WALL) as f32;
+    let up_perp = up - into * up.dot(into);
+    let tip = if up_perp.length() > 0.5 { up_perp.normalize() * (r * (std::f64::consts::SQRT_2 - 1.0)) } else { DVec3::ZERO };
+    let off_face = |t: &[Vec3; 3]| !t.iter().all(|v| face.dist(*v).abs() < ON_PLANE * 10.0);
     let steps = ((depth + r) / (r * 0.5).max(0.5)).ceil() as usize + 1;
     for k in 0..=steps {
         let t = (r * 0.5).max(0.3) + (depth + r - (r * 0.5).max(0.3)) * k as f64 / steps as f64;
-        let p = (center + into * t).as_vec3();
-        if let Some((d, q, _)) = bvh.closest(p, need) {
+        let axis_pt = center + into * t;
+        for p in [axis_pt.as_vec3(), (axis_pt + tip).as_vec3()] {
+        if let Some((d, q, _)) = bvh.closest_where(p, need, off_face) {
             if d < need {
                 if std::env::var_os("S3D_DEBUG_PINS").is_some() {
                     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -210,6 +220,7 @@ fn hole_fits(bvh: &Bvh, center: DVec3, into: DVec3, r: f64, depth: f64) -> bool 
                 }
                 return false;
             }
+        }
         }
     }
     true
@@ -257,28 +268,25 @@ fn hole_solid(center: DVec3, into: DVec3, r: f64, depth: f64, up_print: DVec3) -
 }
 
 /// Per-piece BVHs of the surface without its cut faces, for wall checks.
-fn wall_bvhs(p: &Partition, ids: &[PieceId]) -> HashMap<PieceId, Arc<Bvh>> {
+/// Surface BVH and print "up" (in assembled coordinates) per piece.
+fn wall_bvhs(p: &Partition, ids: &[PieceId]) -> HashMap<PieceId, (Arc<Bvh>, DVec3)> {
     ids.par_iter()
         .filter_map(|id| {
             let q = p.piece(*id)?;
-            let planes: Vec<Plane> = p.seams_of(*id).map(|s| s.plane).collect();
-            let tris: Vec<[Vec3; 3]> = (0..q.mesh.tris.len())
-                .map(|t| q.mesh.tri(t))
-                .filter(|t| !planes.iter().any(|pl| t.iter().all(|v| pl.dist(*v).abs() < ON_PLANE * 10.0)))
-                .collect();
-            Some((*id, Arc::new(Bvh::from_triangles(tris))))
+            let up = q.orient.map(|o| (o.rotation.inverse() * Vec3::Z).as_dvec3()).unwrap_or(DVec3::Z);
+            Some((*id, (Arc::new(Bvh::new(&q.mesh)), up)))
         })
         .collect()
 }
 
 /// Pins whose hole would break through a wall in either piece.
-fn reject_pins(pins: &[(Seam, Vec<DVec3>)], bvhs: &HashMap<PieceId, Arc<Bvh>>, axes: &HashMap<u32, DVec3>, r: f64, depth: f64) -> Vec<(u32, DVec3)> {
+fn reject_pins(pins: &[(Seam, Vec<DVec3>)], bvhs: &HashMap<PieceId, (Arc<Bvh>, DVec3)>, axes: &HashMap<u32, DVec3>, r: f64, depth: f64) -> Vec<(u32, DVec3)> {
     pins.par_iter()
         .flat_map_iter(|(sm, centres)| {
             let ax = axes.get(&sm.id).copied().unwrap_or(sm.plane.normal);
             centres.iter().filter_map(move |ctr| {
-                let ok_a = bvhs.get(&sm.a).is_some_and(|b| hole_fits(b, *ctr, ax, r, depth));
-                let ok_b = bvhs.get(&sm.b).is_some_and(|b| hole_fits(b, *ctr, -ax, r, depth));
+                let ok_a = bvhs.get(&sm.a).is_some_and(|(b, up)| hole_fits(b, *ctr, ax, r, depth, &sm.plane, *up));
+                let ok_b = bvhs.get(&sm.b).is_some_and(|(b, up)| hole_fits(b, *ctr, -ax, r, depth, &sm.plane, *up));
                 (!(ok_a && ok_b)).then_some((sm.id, *ctr))
             })
         })
@@ -305,6 +313,30 @@ pub fn pin_axes(p: &Partition) -> HashMap<u32, DVec3> {
         .collect()
 }
 
+/// Shortest distance between two segments.
+fn segment_distance(a: (DVec3, DVec3), b: (DVec3, DVec3)) -> f64 {
+    let (d1, d2, r) = (a.1 - a.0, b.1 - b.0, a.0 - b.0);
+    let (aa, ee, f) = (d1.dot(d1), d2.dot(d2), d2.dot(r));
+    let (s, t) = if aa < 1e-12 {
+        (0.0, (f / ee.max(1e-12)).clamp(0.0, 1.0))
+    } else {
+        let c = d1.dot(r);
+        let bb = d1.dot(d2);
+        let den = aa * ee - bb * bb;
+        let mut s = if den > 1e-12 { ((bb * f - c * ee) / den).clamp(0.0, 1.0) } else { 0.0 };
+        let mut t = (bb * s + f) / ee.max(1e-12);
+        if t < 0.0 {
+            t = 0.0;
+            s = (-c / aa).clamp(0.0, 1.0);
+        } else if t > 1.0 {
+            t = 1.0;
+            s = ((bb - c) / aa).clamp(0.0, 1.0);
+        }
+        (s, t)
+    };
+    ((a.0 + d1 * s) - (b.0 + d2 * t)).length()
+}
+
 /// Contact smaller than this gets no pin and no warning (mm²).
 pub const MIN_PIN_CONTACT: f64 = 400.0;
 
@@ -327,8 +359,8 @@ pub fn finish(p: &mut Partition, ids: &[PieceId], s: &Settings, job: &JobCtx) ->
             .filter(|x| x.area >= MIN_PIN_CONTACT)
             .map(|x| {
                 let ax = axes.get(&x.id).copied().unwrap_or(x.plane.normal);
-                let fits = |ctr: DVec3| bvhs.get(&x.a).is_some_and(|b| hole_fits(b, ctr, ax, r, depth)) && bvhs.get(&x.b).is_some_and(|b| hole_fits(b, ctr, -ax, r, depth));
-                (x.clone(), place_pins_checked(p, x, c, &fits))
+                let fits = |ctr: DVec3| bvhs.get(&x.a).is_some_and(|(b, up)| hole_fits(b, ctr, ax, r, depth, &x.plane, *up)) && bvhs.get(&x.b).is_some_and(|(b, up)| hole_fits(b, ctr, -ax, r, depth, &x.plane, *up));
+                (x.clone(), place_pins_checked(p, x, c, ax, &fits))
             })
             .collect()
     } else {
@@ -348,7 +380,24 @@ pub fn finish(p: &mut Partition, ids: &[PieceId], s: &Settings, job: &JobCtx) ->
     }
     // Placement already checked the walls; this only guards against overlap
     // with other pins' holes being missed (kept for safety and stats).
-    let rejected = reject_pins(&pins, &bvhs, &axes, r, depth);
+    let mut rejected = reject_pins(&pins, &bvhs, &axes, r, depth);
+    // Holes from different cuts of the same piece must not run into each
+    // other: keep the first, drop pins whose hole comes too close.
+    let gap = 2.0 * r * std::f64::consts::SQRT_2 + MIN_WALL;
+    for list in requests.values() {
+        let mut kept: Vec<(DVec3, DVec3, u32)> = Vec::new();
+        for &(ctr, into, sid) in list {
+            if rejected.iter().any(|x| x.0 == sid && x.1.distance(ctr) < 1e-6) {
+                continue;
+            }
+            let seg = (ctr, ctr + into * (depth + r));
+            if kept.iter().any(|&(c2, i2, s2)| s2 != sid && segment_distance(seg, (c2, c2 + i2 * (depth + r))) < gap) {
+                rejected.push((sid, ctr));
+            } else {
+                kept.push((ctr, into, sid));
+            }
+        }
+    }
     if std::env::var_os("S3D_TIMING").is_some() {
         let total: usize = pins.iter().map(|x| x.1.len()).sum();
         let empty = pins.iter().filter(|x| x.1.is_empty()).count();
@@ -421,7 +470,7 @@ pub fn contact_width(p: &Partition, s: &Seam) -> f64 {
 }
 
 /// Share of pins that fit, and share of sizeable cuts that get a pin.
-fn pin_fit_ratio(p: &Partition, bvhs: &HashMap<PieceId, Arc<Bvh>>, cs: &ConnectorSettings) -> (f64, f64) {
+fn pin_fit_ratio(p: &Partition, bvhs: &HashMap<PieceId, (Arc<Bvh>, DVec3)>, cs: &ConnectorSettings) -> (f64, f64) {
     let (r, depth) = (cs.hole_radius(), cs.hole_depth());
     let axes = pin_axes(p);
     let pins: Vec<(Seam, Vec<DVec3>)> = p
@@ -430,8 +479,8 @@ fn pin_fit_ratio(p: &Partition, bvhs: &HashMap<PieceId, Arc<Bvh>>, cs: &Connecto
         .filter(|s| s.area >= MIN_PIN_CONTACT)
         .map(|s| {
             let ax = axes.get(&s.id).copied().unwrap_or(s.plane.normal);
-            let fits = |ctr: DVec3| bvhs.get(&s.a).is_some_and(|b| hole_fits(b, ctr, ax, r, depth)) && bvhs.get(&s.b).is_some_and(|b| hole_fits(b, ctr, -ax, r, depth));
-            (s.clone(), place_pins_checked(p, s, cs, &fits))
+            let fits = |ctr: DVec3| bvhs.get(&s.a).is_some_and(|(b, up)| hole_fits(b, ctr, ax, r, depth, &s.plane, *up)) && bvhs.get(&s.b).is_some_and(|(b, up)| hole_fits(b, ctr, -ax, r, depth, &s.plane, *up));
+            (s.clone(), place_pins_checked(p, s, cs, ax, &fits))
         })
         .collect();
     let seams_ok = pins.iter().filter(|(_, c)| !c.is_empty()).count();

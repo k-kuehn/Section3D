@@ -46,7 +46,10 @@ pub struct Source {
     pub path: Option<PathBuf>,
     pub mesh: Arc<Mesh>,
     pub health: Health,
+    /// GPU/cache id, unique in this process.
     pub mesh_id: u64,
+    /// Content hash of the mesh: keys results across sessions.
+    pub content: u64,
 }
 
 #[derive(Clone)]
@@ -101,8 +104,31 @@ pub struct Document {
     pub extra_view: Option<serde_json::Value>,
     /// Fingerprint of what was last exported (for the Export step status).
     pub exported_key: Option<u64>,
-    next_id: u64,
     prepared_cache: Option<(u64, Arc<Mesh>, Mat4)>,
+    placement_cache: Option<(u64, Mat4)>,
+}
+
+/// Inputs of the Split step except the edit list (see `Document::split_key`).
+#[derive(Clone, serde::Serialize)]
+pub struct SplitKeyParts {
+    transform: u64,
+    hollow: Option<u64>,
+    printer: s3d_core::settings::PrinterSettings,
+    split: s3d_core::settings::SplitSettings,
+    zones: Zones,
+}
+
+impl SplitKeyParts {
+    pub fn key(&self, edits: &[EditOp]) -> u64 {
+        fingerprint(&(self.transform, self.hollow, &self.printer, &self.split, &self.zones, edits))
+    }
+}
+
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Process-wide unique id for GPU and picking caches.
+pub fn new_id() -> u64 {
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Default for Document {
@@ -119,16 +145,15 @@ impl Default for Document {
             dirty: false,
             extra_view: None,
             exported_key: None,
-            next_id: 1,
             prepared_cache: None,
+            placement_cache: None,
         }
     }
 }
 
 impl Document {
     pub fn new_id(&mut self) -> u64 {
-        self.next_id += 1;
-        self.next_id
+        new_id()
     }
 
     pub fn title(&self) -> String {
@@ -149,7 +174,35 @@ impl Document {
 
     fn transform_key(&self) -> u64 {
         let p = &self.settings.prepare;
-        fingerprint(&(p.rotate, p.scale, p.mirror, self.source.as_ref().map(|s| s.mesh_id)))
+        fingerprint(&(p.rotate, p.scale, p.mirror, self.source.as_ref().map(|s| s.content)))
+    }
+
+    /// Source -> prepared transform, computed from transformed bounds only
+    /// (no mesh copy), so dragging Prepare values stays cheap.
+    pub fn placement(&mut self) -> Option<Mat4> {
+        let src = self.source.as_ref()?;
+        let key = self.transform_key();
+        if let Some((k, t)) = self.placement_cache {
+            if k == key {
+                return Some(t);
+            }
+        }
+        let shape = self.shape_transform();
+        let bb = src.mesh.transformed_bbox(&shape);
+        let c = bb.center();
+        let t = Mat4::from_translation(Vec3::new(-c.x, -c.y, -bb.min.z)) * shape;
+        self.placement_cache = Some((key, t));
+        Some(t)
+    }
+
+    /// What to draw before splitting: (mesh, cache id, model matrix).
+    pub fn display_model(&mut self) -> Option<(Arc<Mesh>, u64, Mat4)> {
+        if let Some(h) = self.valid_hollow() {
+            return Some((h.mesh.clone(), h.mesh_id, Mat4::IDENTITY));
+        }
+        let t = self.placement()?;
+        let s = self.source.as_ref()?;
+        Some((s.mesh.clone(), s.mesh_id, t))
     }
 
     /// Full source → prepared transform: shape transform, then centred on
@@ -167,14 +220,9 @@ impl Document {
                 return Some((self.valid_hollow().map(|h| h.mesh.clone()).unwrap_or_else(|| m.clone()), *t));
             }
         }
-        let shape = self.shape_transform();
-        let mut mesh = src.mesh.transformed(&shape);
-        let bb = mesh.bbox();
-        let c = bb.center();
-        let place = Mat4::from_translation(Vec3::new(-c.x, -c.y, -bb.min.z));
-        mesh.translate(Vec3::new(-c.x, -c.y, -bb.min.z));
-        let m = Arc::new(mesh);
-        let t = place * shape;
+        let _ = src;
+        let t = self.placement()?;
+        let m = Arc::new(self.source.as_ref()?.mesh.transformed(&t));
         self.prepared_cache = Some((key, m.clone(), t));
         Some((self.valid_hollow().map(|h| h.mesh.clone()).unwrap_or(m), t))
     }
@@ -185,14 +233,6 @@ impl Document {
         self.prepared_cache.as_ref().map(|(_, m, t)| (m.clone(), *t))
     }
 
-    /// Mesh id of whatever `prepared_mesh` returns.
-    pub fn prepared_id(&self) -> u64 {
-        match self.valid_hollow() {
-            Some(h) => h.mesh_id,
-            None => self.source.as_ref().map(|s| s.mesh_id ^ self.transform_key()).unwrap_or(0),
-        }
-    }
-
     pub fn hollow_key(&self) -> u64 {
         fingerprint(&(self.transform_key(), self.settings.prepare.wall))
     }
@@ -201,10 +241,14 @@ impl Document {
         self.hollow.as_ref().filter(|h| h.key == self.hollow_key())
     }
 
+    pub fn split_key_parts(&self) -> SplitKeyParts {
+        let s = &self.settings;
+        SplitKeyParts { transform: self.transform_key(), hollow: self.hollow.as_ref().map(|h| h.key), printer: s.printer.clone(), split: s.split.clone(), zones: self.zones.clone() }
+    }
+
     /// Fingerprint of all inputs of the Split step.
     pub fn split_key(&self) -> u64 {
-        let s = &self.settings;
-        fingerprint(&(self.transform_key(), self.hollow.as_ref().map(|h| (h.key, h.mesh_id)), &s.printer, &s.split, &self.zones, &self.edits))
+        self.split_key_parts().key(&self.edits)
     }
 
     pub fn conn_key(&self) -> u64 {

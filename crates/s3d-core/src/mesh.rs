@@ -154,6 +154,38 @@ impl Mesh {
         self.verts = verts;
     }
 
+    /// Stable hash of the geometry (FNV-1a over chunk hashes), used to tell
+    /// whether results were computed from this exact mesh.
+    pub fn content_hash(&self) -> u64 {
+        fn fnv(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+        }
+        let vb: &[u8] = bytemuck::cast_slice(&self.verts);
+        let tb: &[u8] = bytemuck::cast_slice(&self.tris);
+        let parts: Vec<u64> = vb.par_chunks(1 << 16).chain(tb.par_chunks(1 << 16)).map(fnv).collect();
+        let mut all = Vec::with_capacity(parts.len() * 8 + 16);
+        all.extend_from_slice(&(self.verts.len() as u64).to_le_bytes());
+        all.extend_from_slice(&(self.tris.len() as u64).to_le_bytes());
+        for p in parts {
+            all.extend_from_slice(&p.to_le_bytes());
+        }
+        fnv(&all)
+    }
+
+    /// Bounds after applying `m`, without building a transformed copy.
+    pub fn transformed_bbox(&self, m: &Mat4) -> Aabb {
+        self.verts
+            .par_chunks(65536)
+            .map(|c| {
+                let mut b = Aabb::EMPTY;
+                for v in c {
+                    b.grow(m.transform_point3(*v));
+                }
+                b
+            })
+            .reduce(|| Aabb::EMPTY, |a, b| a.union(&b))
+    }
+
     /// Flat-shaded vertex stream (3 verts per triangle) for rendering.
     pub fn unindexed_positions(&self) -> Vec<Vec3> {
         self.tris.par_iter().flat_map_iter(|t| t.map(|i| self.verts[i as usize])).collect()

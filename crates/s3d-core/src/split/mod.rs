@@ -30,6 +30,8 @@ pub struct SplitInput {
     pub edits: Vec<EditOp>,
     /// Locked pieces carried over unchanged from the previous result.
     pub keep: Vec<Arc<Solid>>,
+    /// Cut planes bounding the locked pieces (so their seams are found again).
+    pub keep_planes: Vec<Plane>,
     /// Receives the best Triangle layout (as cut lines) while searching.
     pub preview: Option<triangle::PreviewFn>,
 }
@@ -172,6 +174,7 @@ pub fn run(input: SplitInput, job: &JobCtx) -> Result<SplitOutput, String> {
     }
     let mut planes = Vec::new();
     plan.planes(&mut planes);
+    planes.extend_from_slice(&input.keep_planes);
     job.set_stage("Finding seams");
     job.set_progress(0.6);
     part.rebuild_seams(&planes);
@@ -230,7 +233,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.printer.printer = Printer::new("t", 180.0, 180.0, 180.0);
         settings.split.mode = SplitMode::Grid;
-        let out = run(SplitInput { mesh: mesh.clone(), settings, zones: Zones::default(), edits: vec![], keep: vec![], preview: None }, &JobCtx::new()).unwrap();
+        let out = run(SplitInput { mesh: mesh.clone(), settings, zones: Zones::default(), edits: vec![], keep: vec![], keep_planes: vec![], preview: None }, &JobCtx::new()).unwrap();
         let p = &out.partition;
         assert!(p.pieces.len() >= 8, "{}", p.pieces.len());
         let v: f64 = p.total_volume();

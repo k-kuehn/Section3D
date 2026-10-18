@@ -27,7 +27,11 @@ fn block(x: f64, y: f64, z: f64) -> Mesh {
 }
 
 fn run(mesh: &Mesh, s: &Settings, zones: Zones, edits: Vec<EditOp>, keep: Vec<Arc<Solid>>) -> split::SplitOutput {
-    split::run(SplitInput { mesh: Arc::new(mesh.clone()), settings: s.clone(), zones, edits, keep, preview: None }, &JobCtx::new()).unwrap()
+    run_keep(mesh, s, zones, edits, keep, vec![])
+}
+
+fn run_keep(mesh: &Mesh, s: &Settings, zones: Zones, edits: Vec<EditOp>, keep: Vec<Arc<Solid>>, keep_planes: Vec<s3d_core::plane::Plane>) -> split::SplitOutput {
+    split::run(SplitInput { mesh: Arc::new(mesh.clone()), settings: s.clone(), zones, edits, keep, keep_planes, preview: None }, &JobCtx::new()).unwrap()
 }
 
 fn assert_valid(p: &s3d_core::partition::Partition, source_volume: f64) {
@@ -104,10 +108,12 @@ fn locked_piece_survives_resplit() {
     let s = settings(SplitMode::Grid);
     let first = run(&m, &s, Zones::default(), vec![], vec![]);
     let locked = &first.partition.pieces[0];
+    let planes: Vec<s3d_core::plane::Plane> = first.partition.seams_of(locked.id).map(|s| s.plane).collect();
     let mut s2 = s.clone();
     s2.printer.printer = Printer::new("smaller", 150.0, 150.0, 150.0);
-    let again = run(&m, &s2, Zones::default(), vec![], vec![locked.solid.clone()]);
+    let again = run_keep(&m, &s2, Zones::default(), vec![], vec![locked.solid.clone()], planes);
     let kept = again.partition.pieces.iter().find(|q| q.locked).expect("locked piece kept");
+    assert!(again.partition.seams_of(kept.id).count() > 0, "locked piece keeps its seams");
     assert!((kept.volume - locked.volume).abs() < 1e-3);
     assert!((kept.centroid - locked.centroid).length() < 1e-3);
     assert_valid(&again.partition, m.volume());
@@ -195,4 +201,55 @@ fn packing_keeps_assembly_order() {
     // Beds hold consecutive pieces in order.
     let flat: Vec<u32> = l.beds.iter().flat_map(|b| b.iter().map(|p| p.piece)).collect();
     assert_eq!(flat, (0..6).collect::<Vec<_>>());
+}
+
+/// Area of a mesh's faces lying on a plane.
+fn area_on(m: &Mesh, pl: &s3d_core::plane::Plane) -> f64 {
+    (0..m.tris.len()).filter(|&t| m.tri(t).iter().all(|v| pl.dist(*v).abs() < 0.01)).map(|t| m.tri_cross(t).length() as f64 * 0.5).sum()
+}
+
+#[test]
+fn holes_only_open_on_their_own_cut_face() {
+    // Block cut at z = 50, then the top cut by a 45° plane (reviewer case).
+    let mut p = s3d_core::partition::Partition::from_solids(vec![Solid::cube(DVec3::new(200.0, 100.0, 100.0), false).unwrap()]);
+    p.split_piece(0, s3d_core::plane::Plane::axis(2, 50.0)).unwrap();
+    let top = p.pieces.iter().find(|q| q.centroid.z > 50.0).unwrap().id;
+    p.split_piece(top, s3d_core::plane::Plane::through(DVec3::new(25.0, 0.0, 50.0), DVec3::new(1.0, 0.0, 1.0))).unwrap();
+    let mut s = Settings::default();
+    s.connectors.labels = s3d_core::settings::LabelMode::Off;
+    let params = split::orient_params(&s);
+    let ids: Vec<u32> = p.pieces.iter().map(|q| q.id).collect();
+    split::orient_pieces(&mut p, &ids, &params);
+    s3d_core::connectors::finish(&mut p, &ids, &s, &JobCtx::new()).unwrap();
+    let pins = s3d_core::connectors::all_pins(&p, &s.connectors);
+    let r = s.connectors.hole_radius();
+    for q in &p.pieces {
+        let fin = q.finished.as_ref().unwrap();
+        assert!(s3d_core::repair::edge_stats(fin).is_closed_manifold());
+        for seam in p.seams_of(q.id) {
+            let lost = area_on(&q.mesh, &seam.plane) - area_on(fin, &seam.plane);
+            let n = pins.iter().filter(|x| x.seam == seam.id).count() as f64;
+            let cos = pins.iter().find(|x| x.seam == seam.id).map(|x| x.axis.dot(seam.plane.normal).abs()).unwrap_or(1.0);
+            let max = n * (std::f64::consts::PI * r * r + r * r) / cos * 1.3 + 1.0;
+            assert!(lost <= max, "piece {} lost {lost:.1} mm² on a cut face with {n} pins (max {max:.1})", q.id);
+        }
+    }
+}
+
+#[test]
+fn nudged_grid_cells_still_fit() {
+    let m = block(524.4, 100.0, 100.0);
+    let s = settings(SplitMode::Grid);
+    let plain = run(&m, &s, Zones::default(), vec![], vec![]);
+    // Paint just inside each cut so the cuts are pushed apart.
+    let dabs: Vec<Dab> = plain
+        .partition
+        .seams
+        .iter()
+        .filter(|x| x.plane.normal.x.abs() > 0.99)
+        .map(|x| x.plane.offset.abs() as f32)
+        .map(|x| Dab { p: Vec3::new(x + if x > 262.0 { -3.0 } else { 3.0 }, 50.0, 100.0), radius: 6.0 })
+        .collect();
+    let out = run(&m, &s, Zones { dabs }, vec![], vec![]);
+    assert!(out.partition.pieces.iter().all(|q| !q.flags.contains(&Flag::TooBig)));
 }

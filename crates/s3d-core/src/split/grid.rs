@@ -44,7 +44,11 @@ pub fn plan(bb: &Aabb, cell: [f32; 3], zones: &Zones) -> Plan {
             // Shrink cells a little so nudged cuts still keep pieces within the bed.
             let c = cell[a] * 0.92;
             let mut p = positions(bb.min[a], bb.max[a], c);
-            nudge(a, &mut p, (cell[a] * 0.08) as f64 * 0.95, zones);
+            // Each cut may move by half the room left in a cell, so two cuts
+            // moving apart still keep the cell within the bed.
+            let spacing = (bb.max[a] - bb.min[a]) as f64 / (p.len() + 1) as f64;
+            let slack = ((cell[a] as f64 - spacing) * 0.5 * 0.95).max(0.0);
+            nudge(a, &mut p, slack, zones);
             p
         })
         .collect();

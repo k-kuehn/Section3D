@@ -217,3 +217,23 @@ fn light_theme_and_help() {
         assert!(s3d_app::tooltips::get(id).is_some(), "{id}");
     }
 }
+
+#[test]
+fn undo_split_on_assembly_tab_does_not_crash() {
+    let mut h = harness();
+    h.run_steps(2);
+    h.state_mut().start_import(sample_model());
+    wait_jobs(&mut h);
+    h.state_mut().step = Step::Split;
+    h.state_mut().doc.settings.split.mode = s3d_core::settings::SplitMode::Grid;
+    h.step();
+    h.get_by_label("Split").click();
+    wait_jobs(&mut h);
+    h.state_mut().view.tab = s3d_app::view::Tab::Assembly;
+    h.run_steps(2);
+    while h.state().doc.split.is_some() && h.state().undo.can_undo() {
+        h.state_mut().undo();
+        h.run_steps(2);
+    }
+    assert!(h.state().doc.split.is_none());
+}

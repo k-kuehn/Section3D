@@ -173,6 +173,11 @@ impl Bvh {
 
     /// Closest point on the surface within `max_dist`: (distance, point, tri).
     pub fn closest(&self, p: Vec3, max_dist: f32) -> Option<(f32, Vec3, u32)> {
+        self.closest_where(p, max_dist, |_| true)
+    }
+
+    /// Like `closest`, considering only triangles accepted by `keep`.
+    pub fn closest_where(&self, p: Vec3, max_dist: f32, keep: impl Fn(&[Vec3; 3]) -> bool) -> Option<(f32, Vec3, u32)> {
         let mut best_d2 = max_dist * max_dist;
         let mut best = None;
         let mut stack = Vec::with_capacity(64);
@@ -186,7 +191,7 @@ impl Bvh {
                 for &t in &self.order[n.start as usize..(n.start + n.count) as usize] {
                     let q = closest_on_tri(p, &self.tris[t as usize]);
                     let d2 = q.distance_squared(p);
-                    if d2 < best_d2 {
+                    if d2 < best_d2 && keep(&self.tris[t as usize]) {
                         best_d2 = d2;
                         best = Some((q, t));
                     }

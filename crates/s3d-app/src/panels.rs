@@ -323,7 +323,7 @@ fn edits_card(app: &mut S3dApp, ui: &mut Ui) {
                 }
                 ui.label(format!("{}. {}", i + 1, e.describe()));
                 widgets::right(ui, |ui| {
-                    if ui.small_button("✕").on_hover_text("Remove this edit (takes effect on the next split)").clicked() {
+                    if ui.add_enabled(!app.jobs.busy(), egui::Button::new("✕").small()).on_hover_text("Remove this edit (takes effect on the next split)").clicked() {
                         remove = Some(i);
                     }
                 });

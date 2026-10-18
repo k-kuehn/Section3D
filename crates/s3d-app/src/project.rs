@@ -22,7 +22,7 @@ impl Saved {
             source: doc.source.as_ref().map(|s| SourceData { name: s.name.clone(), path: s.path.as_ref().map(|p| p.display().to_string()), health: s.health.clone(), mesh: s.mesh.clone() }),
             hollow: doc.hollow.as_ref().map(|h| (h.key, h.mesh.clone())),
             split: doc.split.as_ref().map(|s| SplitData { key: s.key, conn_key: s.conn_key, partition: s.partition.clone() }),
-            extra: view.to_json(),
+            extra: view.to_json(doc),
         })
     }
 }
@@ -42,7 +42,8 @@ impl Loaded {
         doc.zones = d.zones;
         if let Some(s) = d.source {
             let id = doc.new_id();
-            doc.source = Some(Source { name: s.name, path: s.path.map(PathBuf::from), mesh: s.mesh, health: s.health, mesh_id: id });
+            let content = s.mesh.content_hash();
+            doc.source = Some(Source { name: s.name, path: s.path.map(PathBuf::from), mesh: s.mesh, health: s.health, mesh_id: id, content });
         }
         if let Some((key, mesh)) = d.hollow {
             let id = doc.new_id();
@@ -54,7 +55,7 @@ impl Loaded {
         }
         doc.extra_view = Some(d.extra);
         // Autosave copies are not the user's file.
-        let is_autosave = self.path.as_ref().zip(autosave_path()).is_some_and(|(a, b)| *a == b);
+        let is_autosave = self.path.as_ref().is_some_and(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("autosave-")));
         doc.path = if is_autosave { None } else { self.path };
         doc.dirty = is_autosave;
         doc
@@ -72,16 +73,24 @@ pub fn load(path: &std::path::Path, job: &JobCtx) -> Result<Loaded, String> {
     Ok(Loaded { data: s3d_core::project::load(path, job)?, path: Some(path.to_path_buf()) })
 }
 
-pub fn autosave_path() -> Option<PathBuf> {
+fn session_dir() -> Option<PathBuf> {
     if std::env::var_os("S3D_NO_CONFIG").is_some() {
         return None;
     }
-    data_dir().map(|d| d.join("autosave.s3d"))
+    data_dir().map(|d| d.join("sessions"))
 }
 
-fn lock_path() -> Option<PathBuf> {
-    autosave_path().map(|p| p.with_file_name("running.lock"))
+/// This session's autosave file (one per running instance).
+pub fn autosave_path() -> Option<PathBuf> {
+    session_dir().map(|d| d.join(format!("autosave-{}.s3d", std::process::id())))
 }
+
+fn lock_path(pid: u32) -> Option<PathBuf> {
+    session_dir().map(|d| d.join(format!("running-{pid}.lock")))
+}
+
+/// Handle on this session's lock file, held open (unshared) while running.
+static LOCK: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
 pub fn clear_autosave() {
     if let Some(p) = autosave_path() {
@@ -89,23 +98,59 @@ pub fn clear_autosave() {
     }
 }
 
-/// True if the previous session did not exit cleanly.
-pub fn crashed_last_time() -> bool {
-    lock_path().is_some_and(|p| p.exists())
+/// Autosaves left by sessions that ended without a clean exit. A running
+/// instance holds its lock file open, so only dead sessions' locks can be
+/// removed.
+pub fn crashed_sessions() -> Vec<PathBuf> {
+    let Some(dir) = session_dir() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let me = std::process::id();
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix("running-").and_then(|r| r.strip_suffix(".lock")).and_then(|r| r.parse::<u32>().ok()) else { continue };
+        if pid == me || std::fs::remove_file(e.path()).is_err() {
+            continue;
+        }
+        let save = dir.join(format!("autosave-{pid}.s3d"));
+        if save.exists() {
+            out.push(save);
+        }
+    }
+    // Autosaves whose lock was already cleaned up but never recovered.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) = name.strip_prefix("autosave-").and_then(|r| r.strip_suffix(".s3d")).and_then(|r| r.parse::<u32>().ok()) else { continue };
+            if pid != me && !dir.join(format!("running-{pid}.lock")).exists() && !out.contains(&e.path()) {
+                out.push(e.path());
+            }
+        }
+    }
+    out
 }
 
 pub fn mark_running() {
-    if let Some(p) = lock_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(p, std::process::id().to_string());
+    let Some(p) = lock_path(std::process::id()) else { return };
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
+    if let Ok(f) = opts.open(&p) {
+        *LOCK.lock().unwrap() = Some(f);
     }
 }
 
-/// Called on a normal exit: the autosave is only for crash recovery.
+/// Called on a normal exit: this session's autosave is only for crashes.
 pub fn mark_clean_exit() {
-    if let Some(p) = lock_path() {
+    LOCK.lock().unwrap().take();
+    if let Some(p) = lock_path(std::process::id()) {
         let _ = std::fs::remove_file(p);
     }
     clear_autosave();

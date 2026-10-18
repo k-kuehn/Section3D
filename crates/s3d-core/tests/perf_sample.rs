@@ -50,7 +50,7 @@ fn grid_split_sample() {
     let t = Instant::now();
     let job = JobCtx::new();
     let out = s3d_core::split::run(
-        s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings, zones: Default::default(), edits: vec![], keep: vec![], preview: None },
+        s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings, zones: Default::default(), edits: vec![], keep: vec![], keep_planes: vec![], preview: None },
         &job,
     )
     .unwrap();
@@ -102,7 +102,7 @@ fn triangle_split_sample() {
     });
     let job = JobCtx::new();
     let out = s3d_core::split::run(
-        s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings, zones: Default::default(), edits: vec![], keep: vec![], preview: Some(preview) },
+        s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings, zones: Default::default(), edits: vec![], keep: vec![], keep_planes: vec![], preview: Some(preview) },
         &job,
     )
     .unwrap();
@@ -134,7 +134,7 @@ fn export_sample() {
     s.connectors.diameter = 2.0;
     s.connectors.length = 8.0;
     let job = JobCtx::new();
-    let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings: s.clone(), zones: Default::default(), edits: vec![], keep: vec![], preview: None }, &job).unwrap();
+    let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings: s.clone(), zones: Default::default(), edits: vec![], keep: vec![], keep_planes: vec![], preview: None }, &job).unwrap();
     let mut part = out.partition;
     let ids: Vec<u32> = part.pieces.iter().map(|q| q.id).collect();
     let t = Instant::now();

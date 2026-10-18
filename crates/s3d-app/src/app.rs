@@ -20,7 +20,8 @@ pub enum JobOut {
     Split(SplitState, Vec<EditStatus>),
     /// Result of an incremental edit or connector update.
     /// `pin_advice`: Some(new advice) when connectors were redone for all pieces.
-    Updated { partition: Partition, edits: Vec<EditOp>, status: Vec<EditStatus>, conn_key: Option<u64>, changed: Vec<PieceId>, pin_advice: Option<Option<s3d_core::connectors::PinAdvice>> },
+    /// `appended`: the edit that produced this result (added to the edit list).
+    Updated { partition: Partition, appended: Option<(EditOp, EditStatus)>, key: u64, conn_key: Option<u64>, changed: Vec<PieceId>, pin_advice: Option<Option<s3d_core::connectors::PinAdvice>> },
     /// A seam adjustment preview (not yet applied).
     Preview(view::Preview),
     Arranged(s3d_core::pack::Layout, u64),
@@ -52,6 +53,9 @@ pub struct S3dApp {
     last_autosave: std::time::Instant,
     autosave_rev: u64,
     pub close_confirmed: bool,
+    /// Autosaves of sessions that crashed, offered on the start screen.
+    pub recovery: Vec<PathBuf>,
+    recovering: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +101,8 @@ impl S3dApp {
             last_autosave: std::time::Instant::now(),
             autosave_rev: 0,
             close_confirmed: false,
+            recovery: Vec::new(),
+            recovering: None,
         }
     }
 
@@ -151,7 +157,8 @@ impl S3dApp {
             let mesh = s3d_core::io::load(&path).map_err(|e| e.to_string())?;
             job.set_progress(0.4);
             let r = s3d_core::repair::repair(mesh, job).map_err(|e| e.to_string())?;
-            Ok(JobOut::Imported(Source { name, path: Some(path), mesh: Arc::new(r.mesh), health: r.health, mesh_id: 0 }))
+            let content = r.mesh.content_hash();
+            Ok(JobOut::Imported(Source { name, path: Some(path), mesh: Arc::new(r.mesh), health: r.health, mesh_id: 0, content }))
         });
     }
 
@@ -177,6 +184,7 @@ impl S3dApp {
         let zones = self.doc.zones.transformed(&xf);
         let edits = self.doc.edits.clone();
         let keep: Vec<_> = self.doc.split.as_ref().map(|s| s.partition.pieces.iter().filter(|p| p.locked).map(|p| p.solid.clone()).collect()).unwrap_or_default();
+        let keep_planes: Vec<_> = self.doc.split.as_ref().map(|s| s.partition.pieces.iter().filter(|p| p.locked).flat_map(|p| s.partition.seams_of(p.id).map(|x| x.plane)).collect()).unwrap_or_default();
         let key = self.doc.split_key();
         let conn_key = self.doc.conn_key();
         let ctx = self.ctx_handle();
@@ -189,7 +197,7 @@ impl S3dApp {
             repaint.request_repaint();
         });
         self.jobs.start(JobKind::Split, &ctx, move |job| {
-            let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh, settings: settings.clone(), zones, edits, keep, preview: Some(preview) }, job)?;
+            let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh, settings: settings.clone(), zones, edits, keep, keep_planes, preview: Some(preview) }, job)?;
             let mut partition = out.partition;
             let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
             s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
@@ -203,15 +211,14 @@ impl S3dApp {
         let Some(split) = self.doc.split.clone() else { return };
         let settings = self.doc.settings.clone();
         let conn_key = self.doc.conn_key();
-        let edits = self.doc.edits.clone();
-        let status = self.doc.edit_status.clone();
+        let key = split.key;
         let ctx = self.ctx_handle();
         self.jobs.start(JobKind::Connectors, &ctx, move |job| {
             let mut partition = split.partition.clone();
             let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
             s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
             let advice = pin_advice(&partition, &settings);
-            Ok(JobOut::Updated { partition, edits, status, conn_key: Some(conn_key), changed: all, pin_advice: Some(advice) })
+            Ok(JobOut::Updated { partition, appended: None, key, conn_key: Some(conn_key), changed: all, pin_advice: Some(advice) })
         });
     }
 
@@ -225,8 +232,12 @@ impl S3dApp {
         let Some(split) = self.doc.split.clone() else { return };
         let settings = self.doc.settings.clone();
         let mut edits = self.doc.edits.clone();
-        let mut status = self.doc.edit_status.clone();
         let conn = split.conn_key;
+        // If the pieces were current, they stay current with the new edit;
+        // otherwise keep the old key so the step still shows out of date.
+        let was_current = self.doc.status(Step::Split) == Status::Done;
+        let parts = self.doc.split_key_parts();
+        let old_key = split.key;
         let ctx = self.ctx_handle();
         self.jobs.start(JobKind::Edit, &ctx, move |job| {
             let op = make(job)?;
@@ -248,12 +259,17 @@ impl S3dApp {
             let params = s3d_core::split::orient_params(&settings);
             s3d_core::split::orient_pieces(&mut partition, &touched, &params);
             if conn.is_some() {
-                s3d_core::connectors::finish(&mut partition, &touched, &settings, job)?;
+                // Pin directions follow the global assembly order, which an
+                // edit can change anywhere: re-finish every piece so both
+                // halves of each hole pair always match.
+                let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
+                s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
+                touched = all;
             }
             s3d_core::split::flag_assembly(&mut partition);
-            edits.push(op);
-            status.push(st);
-            Ok(JobOut::Updated { partition, edits, status, conn_key: conn, changed: touched, pin_advice: None })
+            edits.push(op.clone());
+            let key = if was_current { parts.key(&edits) } else { old_key };
+            Ok(JobOut::Updated { partition, appended: Some((op, st)), key, conn_key: conn, changed: touched, pin_advice: None })
         });
     }
 
@@ -290,6 +306,9 @@ impl S3dApp {
     }
 
     pub fn save(&mut self, save_as: bool) {
+        if self.doc.source.is_none() || self.jobs.busy() {
+            return;
+        }
         let path = match (&self.doc.path, save_as) {
             (Some(p), false) => Some(p.clone()),
             _ => rfd::FileDialog::new()
@@ -351,7 +370,6 @@ impl S3dApp {
             }
             JobOut::Split(mut st, status) => {
                 st.generation = self.doc.new_id();
-                st.key = self.doc.split_key();
                 let n = st.partition.pieces.len();
                 let flagged = st.partition.pieces.iter().filter(|p| p.flags.iter().any(|f| *f != s3d_core::partition::Flag::SkippedDowel)).count();
                 let pins_skipped = st.partition.pieces.iter().filter(|p| p.flags.contains(&s3d_core::partition::Flag::SkippedDowel)).count();
@@ -371,13 +389,16 @@ impl S3dApp {
                 });
                 self.view.arrange_needed = true;
             }
-            JobOut::Updated { partition, edits, status, conn_key, changed, pin_advice } => {
+            JobOut::Updated { partition, appended, key, conn_key, changed, pin_advice } => {
                 let Some(old) = &self.doc.split else { return };
-                let generation = old.generation;
                 let pin_advice = pin_advice.unwrap_or(old.pin_advice);
-                self.doc.edits = edits;
-                self.doc.edit_status = status;
-                let key = self.doc.split_key();
+                if let Some((op, st)) = appended {
+                    self.doc.edits.push(op);
+                    self.doc.edit_status.push(st);
+                }
+                // New generation: GPU and picking caches must not reuse ids
+                // across results (revisions can repeat after undo).
+                let generation = self.doc.new_id();
                 self.doc.split = Some(Arc::new(SplitState { partition, key, conn_key, generation, pin_advice }));
                 self.doc.dirty = true;
                 self.view.on_pieces_changed(&changed);
@@ -411,6 +432,11 @@ impl S3dApp {
             JobOut::Opened(l) => {
                 self.jobs.cancel();
                 let path = l.path.clone();
+                // A recovered autosave is now this session's work: remove the old copy.
+                if let Some(rec) = self.recovering.take().filter(|r| Some(r) == path.as_ref()) {
+                    self.recovery.retain(|r| *r != rec);
+                    let _ = std::fs::remove_file(&rec);
+                }
                 self.doc = l.into_doc();
                 self.undo.reset(&self.doc);
                 self.view = ViewState::default();
@@ -425,13 +451,8 @@ impl S3dApp {
     }
 
     fn check_recovery(&mut self) {
-        if let Some(p) = project::autosave_path().filter(|p| p.exists()) {
-            if project::crashed_last_time() {
-                self.confirm_discard = None;
-                self.view.recovery = Some(p);
-            }
-        }
         project::mark_running();
+        self.recovery = project::crashed_sessions();
     }
 
     fn autosave(&mut self) {
@@ -487,7 +508,7 @@ impl S3dApp {
             egui::CentralPanel::default().frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin { left: 0, right: 12, top: 12, bottom: 12 })).show(ui, |ui| view::show(self, ui));
         }
         self.dialogs(&ctx);
-        if !ctx.input(|i| i.pointer.any_down()) && !self.jobs.busy() && self.undo.checkpoint(&self.doc) {
+        if !ctx.input(|i| i.pointer.any_down()) && self.undo.checkpoint(&self.doc) {
             self.doc.dirty = true;
         }
         self.autosave();
@@ -495,6 +516,9 @@ impl S3dApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
+        if self.jobs.busy() || self.confirm_discard.is_some() {
+            return;
+        }
         let sc = |m, k| KeyboardShortcut::new(m, k);
         if ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z))) || ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND, Key::Y))) {
             self.redo();
@@ -519,15 +543,23 @@ impl S3dApp {
     pub fn undo(&mut self) {
         if !self.jobs.busy() {
             self.undo.undo(&mut self.doc);
-            self.view.on_new_split();
+            self.after_restore();
         }
     }
 
     pub fn redo(&mut self) {
         if !self.jobs.busy() {
             self.undo.redo(&mut self.doc);
-            self.view.on_new_split();
+            self.after_restore();
         }
+    }
+
+    fn after_restore(&mut self) {
+        self.view.on_new_split();
+        if self.doc.split.is_none() {
+            self.view.tab = crate::view::Tab::Model;
+        }
+        self.view.arrange_needed = true;
     }
 
     fn handle_drop(&mut self, ctx: &egui::Context) {
@@ -702,19 +734,19 @@ impl S3dApp {
                 ui.label(widgets::weak(ui, "or drop an STL, OBJ or 3MF file anywhere"));
             });
             ui.add_space(26.0);
-            if let Some(rec) = self.view.recovery.clone() {
+            if let Some(rec) = self.recovery.first().cloned() {
                 ui.allocate_ui(Vec2::new(420.0, 0.0), |ui| {
                     widgets::card(ui, |ui| {
                         ui.label(RichText::new("Section3D closed unexpectedly").font(theme::semibold(14.0)).color(p.warn));
                         ui.label(widgets::weak(ui, "An autosaved copy of your last session is available."));
                         ui.horizontal(|ui| {
                             if ui.button("Recover").clicked() {
-                                self.view.recovery = None;
+                                self.recovering = Some(rec.clone());
                                 self.start_open(rec.clone());
                             }
                             if ui.button("Discard").clicked() {
-                                self.view.recovery = None;
-                                project::clear_autosave();
+                                self.recovery.retain(|r| *r != rec);
+                                let _ = std::fs::remove_file(&rec);
                             }
                         });
                     });
@@ -758,7 +790,6 @@ impl S3dApp {
                     }
                     if ui.button("Don't save").clicked() {
                         self.confirm_discard = None;
-                        self.doc.dirty = false;
                         self.perform(action.clone());
                     }
                     if ui.button("Cancel").clicked() {

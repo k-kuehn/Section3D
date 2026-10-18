@@ -89,7 +89,6 @@ pub struct ViewState {
     pub arrange_needed: bool,
     /// Set when arranging failed, so it is not retried every frame.
     pub arrange_failed: bool,
-    pub recovery: Option<std::path::PathBuf>,
     bvh: HashMap<u64, Arc<std::sync::OnceLock<Arc<Bvh>>>>,
     assembly: Option<(u64, Arc<Assembly>)>,
     drag: Option<HandleDrag>,
@@ -131,7 +130,6 @@ impl Default for ViewState {
             beds_key: None,
             arrange_needed: false,
             arrange_failed: false,
-            recovery: None,
             bvh: HashMap::new(),
             assembly: None,
             drag: None,
@@ -190,6 +188,7 @@ impl ViewState {
     }
 
     pub fn on_new_split(&mut self) {
+        self.footprints.clear();
         self.selected = None;
         self.hidden.clear();
         self.isolate = None;
@@ -239,8 +238,8 @@ impl ViewState {
         self.arrange_needed = false;
     }
 
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({ "beds": self.beds, "beds_key": self.beds_key })
+    pub fn to_json(&self, doc: &Document) -> serde_json::Value {
+        serde_json::json!({ "beds": self.beds, "beds_current": !self.arrangement_stale(doc) })
     }
 
     pub fn restore(&mut self, doc: &Document) {
@@ -248,9 +247,12 @@ impl ViewState {
             if let Ok(l) = serde_json::from_value::<Layout>(v["beds"].clone()) {
                 self.beds = l;
             }
-            // Keys refer to the previous session's generation numbers; re-key.
-            if !self.beds.beds.is_empty() {
+            // Keys refer to the previous session's generation numbers: re-key
+            // only a layout that was current when saved.
+            if !self.beds.beds.is_empty() && v["beds_current"].as_bool() == Some(true) {
                 self.beds_key = Some(arrange_key(doc));
+            } else {
+                self.arrange_needed = true;
             }
         }
     }
@@ -481,15 +483,15 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
         bg: p.viewport_bg,
         ..Default::default()
     };
-    let show_pieces = app.doc.split.is_some() && matches!(app.step, Step::Split | Step::Connectors | Step::Export) || app.view.tab == Tab::Assembly;
+    let show_pieces = app.doc.split.is_some() && (matches!(app.step, Step::Split | Step::Connectors | Step::Export) || app.view.tab == Tab::Assembly);
     let mut drawn: Vec<Drawn> = Vec::new();
     let mut scene_bb = Aabb::EMPTY;
-    let prepared = app.doc.prepared_mesh();
-    let prepared_id = app.doc.prepared_id();
-    let prepared_xf = prepared.as_ref().map(|x| x.1).unwrap_or(Mat4::IDENTITY);
+    let prepared_xf = app.doc.placement().unwrap_or(Mat4::IDENTITY);
+    // Pick hits are converted to source coordinates for no-cut zones: the
+    // unsplit, unhollowed model is drawn as the source mesh itself.
+    let mut local_is_source = false;
 
-    if show_pieces {
-        let split = app.doc.split.clone().unwrap();
+    if let Some(split) = app.doc.split.clone().filter(|_| show_pieces) {
         let part = &split.partition;
         let center = part.pieces.iter().fold(Aabb::EMPTY, |b, q| b.union(&q.bbox)).center();
         let assembly = if app.view.tab == Tab::Assembly { app.view.assembly(&app.doc) } else { None };
@@ -565,12 +567,13 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
                 plane_quad(&mut frame, s.plane, s.center, (s.area.sqrt() as f32).max(10.0), [p.accent.r() as f32 / 255.0, p.accent.g() as f32 / 255.0, p.accent.b() as f32 / 255.0, 0.10]);
             }
         }
-    } else if let Some((mesh, _)) = prepared.clone() {
-        frame.meshes.push(MeshRef { id: prepared_id, rev: prepared_id, mesh: mesh.clone() });
+    } else if let Some((mesh, id, model)) = app.doc.display_model() {
+        local_is_source = app.doc.valid_hollow().is_none();
+        frame.meshes.push(MeshRef { id, rev: id, mesh: mesh.clone() });
         let c = if p.dark { [0.62, 0.68, 0.76] } else { [0.62, 0.67, 0.74] };
-        frame.items.push(DrawItem { mesh: prepared_id, model: Mat4::IDENTITY, print: Mat4::IDENTITY, color: [c[0], c[1], c[2], 1.0], highlight: [0.0; 4], flags: 0, planes: vec![] });
-        scene_bb = mesh.bbox();
-        drawn.push(Drawn { id: u32::MAX, mesh_id: prepared_id, mesh, model: Mat4::IDENTITY });
+        frame.items.push(DrawItem { mesh: id, model, print: Mat4::IDENTITY, color: [c[0], c[1], c[2], 1.0], highlight: [0.0; 4], flags: 0, planes: vec![] });
+        scene_bb = mesh.transformed_bbox(&model);
+        drawn.push(Drawn { id: u32::MAX, mesh_id: id, mesh, model });
     }
 
     // Triangle search in progress: draw the current best layout's cut lines.
@@ -598,30 +601,38 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
 
     // Interaction.
     let tool_drag = app.view.paint || app.view.drag.is_some() || handle_under_pointer(app, ui);
-    let pick_drawn: Vec<(PieceId, u64, Arc<Mesh>, Mat4)> = drawn.iter().map(|d| (d.id, d.mesh_id, d.mesh.clone(), d.model)).collect();
+    // Picking structures are only needed (and built) while the pointer is
+    // over the viewport; caches keep only meshes drawn now.
     let ctx = ui.ctx().clone();
-    let bvhs: Vec<(PieceId, Arc<Bvh>, Mat4)> = pick_drawn.iter().filter_map(|(id, mid, m, model)| Some((*id, app.view.bvh_for(*mid, m, &ctx)?, *model))).collect();
+    let live: HashSet<u64> = drawn.iter().map(|d| d.mesh_id).collect();
+    app.view.bvh.retain(|k, _| live.contains(k));
+    let over = ctx.pointer_hover_pos().is_some_and(|pos| ui.available_rect_before_wrap().contains(pos)) || app.view.drag.is_some();
+    let bvhs: Vec<(PieceId, Arc<Bvh>, Mat4)> = if over { drawn.iter().filter_map(|d| Some((d.id, app.view.bvh_for(d.mesh_id, &d.mesh, &ctx)?, d.model))).collect() } else { Vec::new() };
     let clip_plane = frame.clip;
-    let pick = |ray: (Vec3, Vec3)| -> Option<(PieceId, Vec3, Vec3)> {
-        let mut best: Option<(f32, PieceId, Vec3, Vec3)> = None;
+    // Returns (piece, world hit, normal, hit in the mesh's own coordinates).
+    let pick_full = |ray: (Vec3, Vec3)| -> Option<(PieceId, Vec3, Vec3, Vec3)> {
+        let mut best: Option<(f32, PieceId, Vec3, Vec3, Vec3)> = None;
         for (id, b, model) in &bvhs {
             let inv = model.inverse();
             let o = inv.transform_point3(ray.0);
             let d = inv.transform_vector3(ray.1);
             if let Some(h) = b.ray(o, d, f32::INFINITY) {
-                let hit = model.transform_point3(o + d * h.t);
+                let local = o + d * h.t;
+                let hit = model.transform_point3(local);
                 if let Some(clip) = clip_plane {
                     if hit.dot(clip.truncate()) > clip.w {
                         continue;
                     }
                 }
-                if best.is_none_or(|bb| h.t < bb.0) {
-                    best = Some((h.t, *id, hit, h.normal.normalize_or_zero()));
+                let wt = (hit - ray.0).length();
+                if best.is_none_or(|bb| wt < bb.0) {
+                    best = Some((wt, *id, hit, model.transform_vector3(h.normal).normalize_or_zero(), local));
                 }
             }
         }
-        best.map(|b| (b.1, b.2, b.3))
+        best.map(|b| (b.1, b.2, b.3, b.4))
     };
+    let pick = |ray: (Vec3, Vec3)| pick_full(ray).map(|h| (h.0, h.1, h.2));
     if app.view.viewport.pending_fit || !app.view.fitted_once {
         let aspect = app.view.viewport.aspect();
         app.view.viewport.camera.fit(&fit_bb, aspect);
@@ -646,9 +657,9 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     // No-cut zone painting (on the unsplit model or pieces).
     if app.view.paint && app.step == Step::Split {
         if let Some(td) = input.tool_drag {
-            if let Some((_, pt, _)) = pick(td.ray) {
-                let inv = prepared_xf.inverse();
-                let src = inv.transform_point3(pt);
+            if let Some((_, _, _, local)) = pick_full(td.ray) {
+                // Undo explode/lift offsets (local), then map prepared -> source.
+                let src = if local_is_source { local } else { prepared_xf.inverse().transform_point3(local) };
                 let scale = prepared_xf.to_scale_rotation_translation().0.abs().max_element().max(1e-6);
                 let r = app.view.brush / scale;
                 if app.view.erase {
