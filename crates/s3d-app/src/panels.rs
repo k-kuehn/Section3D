@@ -430,7 +430,7 @@ fn export(app: &mut S3dApp, ui: &mut Ui) {
             ui.label(RichText::new("Pieces or settings changed — arrange again.").color(p.warn).size(12.5));
         }
         if ui.add_enabled(!busy, egui::Button::new(if n == 0 { "Arrange beds" } else { "Arrange again" }).min_size(Vec2::new(ui.available_width(), 30.0))).clicked() {
-            app.view.arrange(&app.doc);
+            app.start_arrange();
             app.view.tab = view::Tab::Beds;
         }
     });
@@ -464,13 +464,10 @@ fn export(app: &mut S3dApp, ui: &mut Ui) {
         }
         ui.add_space(6.0);
         let ready = !busy && app.doc.split.is_some();
-        if primary_button(ui, "Export", ready).on_hover_text("Writes one 3MF per bed, the print list, guide and viewer").clicked() {
+        if primary_button(ui, "Export files", ready).on_hover_text("Writes one 3MF per bed, the print list, guide and viewer").clicked() {
             let folder = app.doc.settings.export.folder.clone().map(std::path::PathBuf::from).or_else(|| rfd::FileDialog::new().set_title("Export folder").pick_folder());
             if let Some(f) = folder {
                 app.doc.settings.export.folder = Some(f.display().to_string());
-                if app.view.beds.beds.is_empty() || app.view.arrange_needed || app.view.beds_key != Some(view::arrange_key(&app.doc)) {
-                    app.view.arrange(&app.doc);
-                }
                 app.start_export(f);
             }
         }

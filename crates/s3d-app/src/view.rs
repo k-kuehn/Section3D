@@ -87,6 +87,8 @@ pub struct ViewState {
     pub beds: Layout,
     pub beds_key: Option<u64>,
     pub arrange_needed: bool,
+    /// Set when arranging failed, so it is not retried every frame.
+    pub arrange_failed: bool,
     pub recovery: Option<std::path::PathBuf>,
     bvh: HashMap<u64, Arc<Bvh>>,
     assembly: Option<(u64, Arc<Assembly>)>,
@@ -128,6 +130,7 @@ impl Default for ViewState {
             beds: Layout::default(),
             beds_key: None,
             arrange_needed: false,
+            arrange_failed: false,
             recovery: None,
             bvh: HashMap::new(),
             assembly: None,
@@ -139,6 +142,22 @@ impl Default for ViewState {
             search_preview: Default::default(),
         }
     }
+}
+
+/// Packs the current pieces (runs in a background job).
+pub fn compute_arrangement(split: &crate::doc::SplitState, s: &s3d_core::settings::Settings) -> Layout {
+    let u = s.printer.usable();
+    let order: Vec<PieceId> = if s.export.keep_assembly_order {
+        s3d_core::assembly::plan(&split.partition).order
+    } else {
+        split.partition.pieces.iter().map(|p| p.id).collect()
+    };
+    let items: Vec<PackItem> = order
+        .iter()
+        .filter_map(|id| split.partition.piece(*id))
+        .map(|p| PackItem { id: p.id, mesh: p.display_mesh().clone(), print: p.orient.map(|o| o.matrix()).unwrap_or(Mat4::IDENTITY) })
+        .collect();
+    s3d_core::pack::pack(&items, &PackParams { bed: [u[0], u[1]], spacing: s.export.spacing, keep_order: s.export.keep_assembly_order, angle_step: 15.0 })
 }
 
 /// Fingerprint of what the bed layout depends on.
@@ -209,18 +228,14 @@ impl ViewState {
         Some(adjusted_plane(&s.plane, s.center, pd.offset, pd.tilt))
     }
 
-    pub fn arrange(&mut self, doc: &Document) {
-        let Some(split) = &doc.split else { return };
-        let u = doc.settings.printer.usable();
-        let assembly = s3d_core::assembly::plan(&split.partition);
-        let order: Vec<PieceId> = if doc.settings.export.keep_assembly_order { assembly.order.clone() } else { split.partition.pieces.iter().map(|p| p.id).collect() };
-        let items: Vec<PackItem> = order
-            .iter()
-            .filter_map(|id| split.partition.piece(*id))
-            .map(|p| PackItem { id: p.id, mesh: p.display_mesh().clone(), print: p.orient.map(|o| o.matrix()).unwrap_or(Mat4::IDENTITY) })
-            .collect();
-        self.beds = s3d_core::pack::pack(&items, &PackParams { bed: [u[0], u[1]], spacing: doc.settings.export.spacing, keep_order: doc.settings.export.keep_assembly_order, angle_step: 15.0 });
-        self.beds_key = Some(arrange_key(doc));
+    /// True when the bed layout is missing or no longer matches the pieces.
+    pub fn arrangement_stale(&self, doc: &Document) -> bool {
+        self.beds.beds.is_empty() || self.arrange_needed || self.beds_key != Some(arrange_key(doc))
+    }
+
+    pub fn set_arrangement(&mut self, layout: Layout, key: u64) {
+        self.beds = layout;
+        self.beds_key = Some(key);
         self.arrange_needed = false;
     }
 
@@ -320,8 +335,8 @@ pub fn tilt_axis(pl: &Plane) -> DVec3 {
 pub fn show(app: &mut S3dApp, ui: &mut Ui) {
     let p = app.palette();
     app.view.poll_preview(&app.doc, ui.ctx());
-    if app.view.arrange_needed && app.step == Step::Export && !app.jobs.busy() && app.view.tab == Tab::Beds {
-        app.view.arrange(&app.doc);
+    if app.view.tab == Tab::Beds && app.doc.split.is_some() && !app.jobs.busy() && app.view.arrangement_stale(&app.doc) && !app.view.arrange_failed {
+        app.start_arrange();
     }
     egui::Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.card_stroke)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
@@ -364,9 +379,6 @@ fn tabs_row(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
             ui.painter().galley(start + Vec2::new(g.size().x, 1.5), g2, p.text_weak);
             if resp.clicked() && enabled {
                 app.view.tab = tab;
-                if tab == Tab::Beds && (app.view.beds.beds.is_empty() || app.view.beds_key != Some(arrange_key(&app.doc))) {
-                    app.view.arrange(&app.doc);
-                }
             }
         }
     });
@@ -964,8 +976,8 @@ fn beds_view(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
         ui.label(widgets::weak(ui, "· drag pieces to move them, right-click to rotate 90°"));
         if stale {
             ui.label(RichText::new("· out of date").color(p.warn));
-            if ui.small_button("Arrange again").clicked() {
-                app.view.arrange(&app.doc);
+            if ui.add_enabled(!app.jobs.busy(), egui::Button::new("Arrange again").small()).clicked() {
+                app.start_arrange();
             }
         }
     });

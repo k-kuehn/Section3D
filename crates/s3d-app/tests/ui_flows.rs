@@ -129,3 +129,74 @@ fn sample_triangle_screens() {
     h.step();
     shot(&mut h, "s5_front");
 }
+
+#[test]
+fn connectors_export_undo_project_flow() {
+    let mut h = harness();
+    h.run_steps(2);
+    h.state_mut().start_import(sample_model());
+    wait_jobs(&mut h);
+    h.state_mut().step = Step::Split;
+    h.state_mut().doc.settings.split.mode = s3d_core::settings::SplitMode::Triangle;
+    h.state_mut().doc.settings.split.time_limit = 2.0;
+    h.step();
+    h.get_by_label("Split").click();
+    wait_jobs(&mut h);
+    let pieces = h.state().doc.split.as_ref().unwrap().partition.pieces.len();
+    assert!(pieces > 1);
+    shot(&mut h, "10_triangle_small");
+
+    // Selecting a piece shows its properties and cut handles.
+    let first = h.state().doc.split.as_ref().unwrap().partition.pieces[0].id;
+    h.state_mut().view.select(Some(first));
+    h.step();
+    assert!(h.query_by_label("Cuts").is_some() || h.query_by_label("CUTS").is_some());
+    shot(&mut h, "11_selected");
+
+    // Connectors: changing a setting marks the step stale, Update re-runs it.
+    h.state_mut().step = Step::Connectors;
+    h.state_mut().doc.settings.connectors.diameter = 5.0;
+    h.step();
+    assert_eq!(h.state().doc.status(Step::Connectors), s3d_app::doc::Status::Stale);
+    h.get_by_label("Update connectors").click();
+    wait_jobs(&mut h);
+    assert_eq!(h.state().doc.status(Step::Connectors), s3d_app::doc::Status::Done);
+    shot(&mut h, "12_connectors");
+
+    // Undo restores the previous connector setting; redo brings it back.
+    h.state_mut().undo();
+    h.step();
+    assert!((h.state().doc.settings.connectors.diameter - 5.0).abs() > 1e-6 || h.state().undo.can_redo());
+    h.state_mut().redo();
+    h.step();
+
+    // Export writes files and records history.
+    let out = std::env::temp_dir().join(format!("s3d_ui_export_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    h.state_mut().step = Step::Export;
+    h.state_mut().doc.settings.export.folder = Some(out.display().to_string());
+    h.step();
+    h.get_by_label("Export files").click();
+    wait_jobs(&mut h);
+    let files: Vec<String> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(files.iter().any(|f| f.ends_with(".3mf")), "{files:?}");
+    assert!(files.iter().any(|f| f.ends_with(".pdf")), "{files:?}");
+    assert_eq!(h.state().doc.status(Step::Export), s3d_app::doc::Status::Done);
+    h.state_mut().view.tab = s3d_app::view::Tab::Beds;
+    h.step();
+    shot(&mut h, "13_beds");
+    h.state_mut().view.tab = s3d_app::view::Tab::Assembly;
+    h.state_mut().view.assembly_step = 2;
+    h.step();
+    shot(&mut h, "14_assembly");
+
+    // Save and reopen: the pieces come back without re-cutting.
+    let proj = out.join("test.s3d");
+    let data = s3d_app::project::Saved::from_doc(&h.state().doc, &h.state().view);
+    s3d_app::project::save(&proj, &data, &s3d_core::job::JobCtx::new()).unwrap();
+    let loaded = s3d_app::project::load(&proj, &s3d_core::job::JobCtx::new()).unwrap();
+    let doc = loaded.into_doc();
+    assert_eq!(doc.split.as_ref().unwrap().partition.pieces.len(), h.state().doc.split.as_ref().unwrap().partition.pieces.len());
+    assert_eq!(doc.status(Step::Split), s3d_app::doc::Status::Done, "opening never re-cuts");
+    let _ = std::fs::remove_dir_all(&out);
+}

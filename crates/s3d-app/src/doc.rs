@@ -99,6 +99,8 @@ pub struct Document {
     pub dirty: bool,
     /// View state loaded from a project, consumed by the view.
     pub extra_view: Option<serde_json::Value>,
+    /// Fingerprint of what was last exported (for the Export step status).
+    pub exported_key: Option<u64>,
     next_id: u64,
     prepared_cache: Option<(u64, Arc<Mesh>, Mat4)>,
 }
@@ -116,6 +118,7 @@ impl Default for Document {
             path: None,
             dirty: false,
             extra_view: None,
+            exported_key: None,
             next_id: 1,
             prepared_cache: None,
         }
@@ -233,12 +236,17 @@ impl Document {
                     }
                 }
             },
-            Step::Export => match &self.split {
-                None => Status::NotRun,
-                Some(_) if self.status(Step::Connectors) != Status::Done => Status::Stale,
-                Some(_) => Status::Done,
+            Step::Export => match (&self.split, self.exported_key) {
+                (None, _) | (_, None) => Status::NotRun,
+                (Some(_), Some(k)) if self.status(Step::Connectors) != Status::Done || k != self.export_key_basic() => Status::Stale,
+                _ => Status::Done,
             },
         }
+    }
+
+    /// Fingerprint of what an export depends on (pieces and export settings).
+    pub fn export_key_basic(&self) -> u64 {
+        fingerprint(&(self.split.as_ref().map(|s| (s.generation, s.partition.pieces.iter().map(|p| p.rev).collect::<Vec<_>>())), &self.settings.export, &self.settings.printer))
     }
 
     pub fn snapshot(&self) -> Snapshot {

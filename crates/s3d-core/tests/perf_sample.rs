@@ -121,3 +121,31 @@ fn triangle_split_sample() {
     let area: f64 = p.pieces.iter().map(|q| q.mesh.area()).sum::<f64>() / 2.0;
     eprintln!("surface area per piece (half of total area): {:.0} mm2", area / p.pieces.len() as f64);
 }
+
+#[test]
+fn export_sample() {
+    let Some(path) = sample() else { return };
+    let Some(out_dir) = std::env::var_os("S3D_EXPORT_DIR").map(std::path::PathBuf::from) else { return };
+    let mesh = s3d_core::io::load(&path).unwrap();
+    let mesh = s3d_core::repair::repair(mesh, &JobCtx::new()).unwrap().mesh;
+    let mut s = s3d_core::settings::Settings::default();
+    s.printer.printer = s3d_core::printers::Printer::new("X1C", 256.0, 256.0, 256.0);
+    s.split.time_limit = 6.0;
+    s.connectors.diameter = 2.0;
+    s.connectors.length = 8.0;
+    let job = JobCtx::new();
+    let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh: std::sync::Arc::new(mesh), settings: s.clone(), zones: Default::default(), edits: vec![], keep: vec![], preview: None }, &job).unwrap();
+    let mut part = out.partition;
+    let ids: Vec<u32> = part.pieces.iter().map(|q| q.id).collect();
+    let t = Instant::now();
+    s3d_core::connectors::finish(&mut part, &ids, &s, &job).unwrap();
+    eprintln!("connectors {:?}", t.elapsed());
+    let t = Instant::now();
+    let items: Vec<s3d_core::pack::PackItem> = part.pieces.iter().map(|q| s3d_core::pack::PackItem { id: q.id, mesh: q.display_mesh().clone(), print: q.orient.map(|o| o.matrix()).unwrap_or_default() }).collect();
+    let u = s.printer.usable();
+    let layout = s3d_core::pack::pack(&items, &s3d_core::pack::PackParams { bed: [u[0], u[1]], spacing: 4.0, keep_order: false, angle_step: 15.0 });
+    eprintln!("pack {:?}: {} pieces on {} beds ({} unplaced)", t.elapsed(), part.pieces.len(), layout.beds.len(), layout.unplaced.len());
+    let t = Instant::now();
+    let r = s3d_core::export::run(&out_dir, "Body", &part, &layout, &s, &job).unwrap();
+    eprintln!("export {:?}: {}", t.elapsed(), r.summary());
+}

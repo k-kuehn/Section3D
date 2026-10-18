@@ -23,7 +23,9 @@ pub enum JobOut {
     Updated { partition: Partition, edits: Vec<EditOp>, status: Vec<EditStatus>, conn_key: Option<u64>, changed: Vec<PieceId>, pin_advice: Option<Option<s3d_core::connectors::PinAdvice>> },
     /// A seam adjustment preview (not yet applied).
     Preview(view::Preview),
-    Exported(String),
+    Arranged(s3d_core::pack::Layout, u64),
+    /// Export summary, plus a fresh bed layout if one had to be computed.
+    Exported(String, Option<(s3d_core::pack::Layout, u64)>),
     Saved(PathBuf),
     Opened(Box<project::Loaded>),
 }
@@ -254,13 +256,36 @@ impl S3dApp {
         });
     }
 
+    pub fn start_arrange(&mut self) {
+        let Some(split) = self.doc.split.clone() else { return };
+        let settings = self.doc.settings.clone();
+        let key = crate::view::arrange_key(&self.doc);
+        let ctx = self.ctx_handle();
+        self.jobs.start(JobKind::Arrange, &ctx, move |job| {
+            job.set_stage("Packing pieces onto beds");
+            Ok(JobOut::Arranged(crate::view::compute_arrangement(&split, &settings), key))
+        });
+    }
+
     pub fn start_export(&mut self, folder: PathBuf) {
         let Some(split) = self.doc.split.clone() else { return };
         let settings = self.doc.settings.clone();
+        let stale = self.view.arrangement_stale(&self.doc);
         let layout = self.view.beds.clone();
+        let key = crate::view::arrange_key(&self.doc);
         let title = self.doc.title();
         let ctx = self.ctx_handle();
-        self.jobs.start(JobKind::Export, &ctx, move |job| crate::export::run(&folder, &title, &split.partition, &layout, &settings, job).map(JobOut::Exported));
+        self.jobs.start(JobKind::Export, &ctx, move |job| {
+            let fresh = if stale {
+                job.set_stage("Packing pieces onto beds");
+                Some((crate::view::compute_arrangement(&split, &settings), key))
+            } else {
+                None
+            };
+            let l = fresh.as_ref().map(|f| &f.0).unwrap_or(&layout);
+            let msg = crate::export::run(&folder, &title, &split.partition, l, &settings, job)?;
+            Ok(JobOut::Exported(msg, fresh))
+        });
     }
 
     pub fn save(&mut self, save_as: bool) {
@@ -287,6 +312,9 @@ impl S3dApp {
             Ok(o) => o,
             Err(e) if e == "cancelled" => return,
             Err(e) => {
+                if kind == JobKind::Arrange {
+                    self.view.arrange_failed = true;
+                }
                 self.notice = Some(Notice::Error(format!("{} failed: {e}", kind.label())));
                 return;
             }
@@ -355,7 +383,21 @@ impl S3dApp {
                 self.view.arrange_needed = true;
             }
             JobOut::Preview(p) => self.view.preview = Some(p),
-            JobOut::Exported(msg) => {
+            JobOut::Arranged(layout, key) => {
+                let unplaced = layout.unplaced.len();
+                self.view.set_arrangement(layout, key);
+                self.view.arrange_failed = false;
+                self.doc.dirty = true;
+                if unplaced > 0 {
+                    self.notice = Some(Notice::Warn(format!("{unplaced} piece(s) do not fit on a bed.")));
+                }
+            }
+            JobOut::Exported(msg, fresh) => {
+                if let Some((layout, key)) = fresh {
+                    self.view.set_arrangement(layout, key);
+                }
+                self.doc.exported_key = Some(self.doc.export_key_basic());
+                self.recent.add_export(format!("{} - {}", utc_now(), msg));
                 self.notice = Some(Notice::Info(msg));
             }
             JobOut::Saved(path) => {
@@ -741,6 +783,23 @@ impl S3dApp {
     pub fn restore_snapshot(&mut self, s: Snapshot) {
         self.doc.restore(s);
     }
+}
+
+/// Current UTC time as "YYYY-MM-DD HH:MM UTC" (std has no time zones).
+fn utc_now() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let (days, tod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Days to civil date (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", tod / 3600, (tod % 3600) / 60)
 }
 
 /// Pin size advice, only when some pins had to be skipped.
