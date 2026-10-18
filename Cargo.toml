@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/s3d-core", "crates/s3d-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+s3d-core = { path = "crates/s3d-core" }
+glam = { version = "0.34", features = ["serde", "bytemuck"] }
+rayon = "1.12"
+miniz_oxide = "0.9"
+quick-xml = "0.42"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytemuck = { version = "1.25", features = ["derive"] }
+ab_glyph = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Geometry is unusably slow unoptimised; keep tests/dev reasonably fast.
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3

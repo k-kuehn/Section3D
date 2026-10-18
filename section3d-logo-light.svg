@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 240" width="820" height="240">
+<rect width="820" height="240" rx="24" fill="#FFFFFF"/>
+<polygon points="140.00,76.00 181.57,100.00 140.00,124.00 98.43,100.00" fill="#CBD5E1" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="98.43,148.00 140.00,172.00 140.00,124.00 98.43,100.00" fill="#94A3B8" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="181.57,148.00 140.00,172.00 140.00,124.00 181.57,100.00" fill="#64748B" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="98.43,100.00 140.00,124.00 98.43,148.00 56.86,124.00" fill="#CBD5E1" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="56.86,172.00 98.43,196.00 98.43,148.00 56.86,124.00" fill="#94A3B8" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="140.00,172.00 98.43,196.00 98.43,148.00 140.00,124.00" fill="#64748B" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="181.57,100.00 223.14,124.00 181.57,148.00 140.00,124.00" fill="#CBD5E1" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="140.00,172.00 181.57,196.00 181.57,148.00 140.00,124.00" fill="#94A3B8" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="223.14,172.00 181.57,196.00 181.57,148.00 223.14,124.00" fill="#64748B" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="140.00,28.00 181.57,52.00 140.00,76.00 98.43,52.00" fill="#CBD5E1" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="98.43,100.00 140.00,124.00 140.00,76.00 98.43,52.00" fill="#94A3B8" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="181.57,100.00 140.00,124.00 140.00,76.00 181.57,52.00" fill="#64748B" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="140.00,124.00 181.57,148.00 140.00,172.00 98.43,148.00" fill="#CBD5E1" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="98.43,196.00 140.00,220.00 140.00,172.00 98.43,148.00" fill="#94A3B8" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="181.57,196.00 140.00,220.00 140.00,172.00 181.57,148.00" fill="#64748B" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="98.43,52.00 140.00,76.00 98.43,100.00 56.86,76.00" fill="#CBD5E1" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="56.86,124.00 98.43,148.00 98.43,100.00 56.86,76.00" fill="#94A3B8" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="140.00,124.00 98.43,148.00 98.43,100.00 140.00,76.00" fill="#64748B" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="181.57,52.00 223.14,76.00 181.57,100.00 140.00,76.00" fill="#CBD5E1" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="140.00,124.00 181.57,148.00 181.57,100.00 140.00,76.00" fill="#94A3B8" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="223.14,124.00 181.57,148.00 181.57,100.00 223.14,76.00" fill="#64748B" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="146.24,22.00 187.80,46.00 146.24,70.00 104.67,46.00" fill="#FFB088" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="104.67,94.00 146.24,118.00 146.24,70.00 104.67,46.00" fill="#FF6B2C" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<polygon points="187.80,94.00 146.24,118.00 146.24,70.00 187.80,46.00" fill="#D9480F" stroke="#FFFFFF" stroke-width="2.88" stroke-linejoin="round"/>
+<text x="290" y="138" font-family="Inter, 'Segoe UI', Arial, sans-serif" font-size="92" font-weight="800" letter-spacing="-2" fill="#1E293B">Section<tspan fill="#FF6B2C">3D</tspan></text>
+<text x="294" y="182" font-family="Inter, 'Segoe UI', Arial, sans-serif" font-size="25" font-weight="500" letter-spacing="1" fill="#64748B">Split. Connect. Print. Assemble.</text>
+</svg>

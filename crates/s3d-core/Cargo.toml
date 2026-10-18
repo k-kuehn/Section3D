@@ -1,0 +1,20 @@
+[package]
+name = "s3d-core"
+description = "Section3D geometry core: mesh I/O, repair, splitting, connectors, packing, export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+glam.workspace = true
+rayon.workspace = true
+miniz_oxide.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytemuck.workspace = true
+ab_glyph.workspace = true
+
+[build-dependencies]
+cmake = "0.1"

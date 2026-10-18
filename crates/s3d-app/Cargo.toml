@@ -1,0 +1,24 @@
+[package]
+name = "s3d-app"
+description = "Section3D desktop application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "section3d"
+path = "src/main.rs"
+
+[dependencies]
+s3d-core.workspace = true
+glam.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytemuck.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit", "default_fonts"] }
+egui-wgpu = "0.37"
+rfd = "0.17"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu"] }
