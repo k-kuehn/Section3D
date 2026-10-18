@@ -23,7 +23,7 @@ type SdfFn = extern "C" fn(f64, f64, f64, *mut c_void) -> f64;
 unsafe extern "C" {
     fn s3d_mf_free(h: *mut RawMf);
     fn s3d_mesh_free(h: *mut RawMesh);
-    fn s3d_mf_from_mesh(verts: *const f32, nverts: u32, tris: *const u32, ntris: u32) -> *mut RawMf;
+    fn s3d_mf_from_mesh(verts: *const f32, nverts: u32, merge: i32, tris: *const u32, ntris: u32) -> *mut RawMf;
     fn s3d_mf_clone(h: *const RawMf) -> *mut RawMf;
     fn s3d_mf_status(h: *const RawMf) -> i32;
     fn s3d_mf_is_empty(h: *const RawMf) -> i32;
@@ -124,7 +124,7 @@ impl Solid {
 
     pub fn from_mesh(m: &Mesh) -> GResult<Solid> {
         let h = unsafe {
-            s3d_mf_from_mesh(m.verts.as_ptr() as *const f32, m.verts.len() as u32, m.tris.as_ptr() as *const u32, m.tris.len() as u32)
+            s3d_mf_from_mesh(m.verts.as_ptr() as *const f32, m.verts.len() as u32, 0, m.tris.as_ptr() as *const u32, m.tris.len() as u32)
         };
         Solid::wrap(h, "from_mesh")
     }
@@ -228,6 +228,45 @@ impl Solid {
             s3d_mf_free_array(arr);
             out
         }
+    }
+
+    /// Separate solid bodies: like `decompose`, but internal voids stay with
+    /// the shell that encloses them instead of becoming negative solids.
+    pub fn bodies(&self) -> Vec<Solid> {
+        let comps = self.decompose();
+        if comps.len() <= 1 {
+            return comps;
+        }
+        let (mut pos, neg): (Vec<Solid>, Vec<Solid>) = comps.into_iter().partition(|c| c.volume() >= 0.0);
+        if neg.is_empty() {
+            return pos;
+        }
+        let meshes: Vec<Mesh> = pos.iter().map(|s| s.to_mesh()).collect();
+        let bvhs: Vec<crate::bvh::Bvh> = meshes.iter().map(crate::bvh::Bvh::new).collect();
+        let mut groups: Vec<Vec<Solid>> = pos.drain(..).map(|s| vec![s]).collect();
+        for v in neg {
+            let vm = v.to_mesh();
+            let probe = vm.verts.first().copied().unwrap_or_default();
+            let vb = v.bbox();
+            // Smallest enclosing shell wins.
+            let host = (0..groups.len())
+                .filter(|&i| {
+                    let b = bvhs[i].bbox();
+                    b.min.cmple(vb.min).all() && b.max.cmpge(vb.max).all() && bvhs[i].contains(probe)
+                })
+                .min_by(|&a, &b| groups[a][0].volume().total_cmp(&groups[b][0].volume()));
+            match host {
+                Some(i) => groups[i].push(v),
+                None => groups.push(vec![v]), // orphan void: keep as-is
+            }
+        }
+        groups
+            .into_iter()
+            .map(|g| {
+                let refs: Vec<&Solid> = g.iter().collect();
+                if refs.len() == 1 { g.into_iter().next().unwrap() } else { Solid::compose(&refs).expect("compose") }
+            })
+            .collect()
     }
 
     pub fn transform(&self, m: &DMat4) -> GResult<Solid> {

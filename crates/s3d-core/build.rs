@@ -8,6 +8,8 @@ fn main() {
         .define("MANIFOLD_SRC", manifold_src.to_str().unwrap().replace('\\', "/"))
         // Manifold is unusably slow in Debug; always build it optimised.
         .profile("Release")
+        // The cmake crate's default flags carry no optimisation level.
+        .define("CMAKE_CXX_FLAGS_RELEASE", "/O2 /Ob2 /DNDEBUG /MD /EHsc /nologo /W0")
         .build();
     println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
     println!("cargo:rustc-link-lib=static=s3d_manifold");

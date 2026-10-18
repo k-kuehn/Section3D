@@ -39,7 +39,7 @@ extern "C" {
 void s3d_mf_free(S3dMf* h) { delete h; }
 void s3d_mesh_free(S3dMesh* h) { delete h; }
 
-S3dMf* s3d_mf_from_mesh(const float* verts, uint32_t nverts,
+S3dMf* s3d_mf_from_mesh(const float* verts, uint32_t nverts, int merge,
                         const uint32_t* tris, uint32_t ntris) {
   GUARD(
       {
@@ -47,7 +47,7 @@ S3dMf* s3d_mf_from_mesh(const float* verts, uint32_t nverts,
         gl.numProp = 3;
         gl.vertProperties.assign(verts, verts + size_t(nverts) * 3);
         gl.triVerts.assign(tris, tris + size_t(ntris) * 3);
-        gl.Merge();
+        if (merge) gl.Merge();
         return wrap(Manifold(gl));
       },
       nullptr)
