@@ -29,7 +29,8 @@ pub struct Pin {
     pub seam: u32,
     /// Centre on the cut plane.
     pub center: DVec3,
-    /// Plane normal (points from piece `b` into piece `a`).
+    /// Hole direction into piece `a` (the insertion direction of the piece
+    /// assembled later); the hole in `b` runs the opposite way.
     pub axis: DVec3,
 }
 
@@ -271,14 +272,35 @@ fn wall_bvhs(p: &Partition, ids: &[PieceId]) -> HashMap<PieceId, Arc<Bvh>> {
 }
 
 /// Pins whose hole would break through a wall in either piece.
-fn reject_pins(pins: &[(Seam, Vec<DVec3>)], bvhs: &HashMap<PieceId, Arc<Bvh>>, r: f64, depth: f64) -> Vec<(u32, DVec3)> {
+fn reject_pins(pins: &[(Seam, Vec<DVec3>)], bvhs: &HashMap<PieceId, Arc<Bvh>>, axes: &HashMap<u32, DVec3>, r: f64, depth: f64) -> Vec<(u32, DVec3)> {
     pins.par_iter()
         .flat_map_iter(|(sm, centres)| {
+            let ax = axes.get(&sm.id).copied().unwrap_or(sm.plane.normal);
             centres.iter().filter_map(move |ctr| {
-                let ok_a = bvhs.get(&sm.a).is_some_and(|b| hole_fits(b, *ctr, sm.plane.normal, r, depth));
-                let ok_b = bvhs.get(&sm.b).is_some_and(|b| hole_fits(b, *ctr, -sm.plane.normal, r, depth));
+                let ok_a = bvhs.get(&sm.a).is_some_and(|b| hole_fits(b, *ctr, ax, r, depth));
+                let ok_b = bvhs.get(&sm.b).is_some_and(|b| hole_fits(b, *ctr, -ax, r, depth));
                 (!(ok_a && ok_b)).then_some((sm.id, *ctr))
             })
+        })
+        .collect()
+}
+
+/// Direction of the hole into piece `a` for every seam: along the insertion
+/// direction of whichever piece is assembled later, so one straight move seats
+/// all of its pins. Falls back to the face normal.
+pub fn pin_axes(p: &Partition) -> HashMap<u32, DVec3> {
+    let asm = crate::assembly::plan(p);
+    let pos: HashMap<PieceId, usize> = asm.order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    p.seams
+        .iter()
+        .map(|s| {
+            let (pa, pb) = (pos.get(&s.a).copied().unwrap_or(0), pos.get(&s.b).copied().unwrap_or(0));
+            let later = if pa > pb { s.a } else { s.b };
+            let d = asm.insert_dir.get(&later).map(|v| v.as_dvec3().normalize()).unwrap_or(DVec3::ZERO);
+            // The later piece moves along d; d points into the earlier piece.
+            let into_a = if later == s.b { d } else { -d };
+            let ok = into_a.dot(s.plane.normal) >= 0.3;
+            (s.id, if ok { into_a } else { s.plane.normal })
         })
         .collect()
 }
@@ -298,14 +320,14 @@ pub fn finish(p: &mut Partition, ids: &[PieceId], s: &Settings, job: &JobCtx) ->
     involved.sort_unstable();
     involved.dedup();
     let bvhs = if c.dowels { wall_bvhs(p, &involved) } else { HashMap::new() };
+    let axes = pin_axes(p);
     let pins: Vec<(Seam, Vec<DVec3>)> = if c.dowels {
         seams
             .par_iter()
             .filter(|x| x.area >= MIN_PIN_CONTACT)
             .map(|x| {
-                let fits = |ctr: DVec3| {
-                    bvhs.get(&x.a).is_some_and(|b| hole_fits(b, ctr, x.plane.normal, r, depth)) && bvhs.get(&x.b).is_some_and(|b| hole_fits(b, ctr, -x.plane.normal, r, depth))
-                };
+                let ax = axes.get(&x.id).copied().unwrap_or(x.plane.normal);
+                let fits = |ctr: DVec3| bvhs.get(&x.a).is_some_and(|b| hole_fits(b, ctr, ax, r, depth)) && bvhs.get(&x.b).is_some_and(|b| hole_fits(b, ctr, -ax, r, depth));
                 (x.clone(), place_pins_checked(p, x, c, &fits))
             })
             .collect()
@@ -319,13 +341,14 @@ pub fn finish(p: &mut Partition, ids: &[PieceId], s: &Settings, job: &JobCtx) ->
     for (sm, centres) in &pins {
         for ctr in centres {
             // `a` is on the positive side: holes go +n into a, -n into b.
-            requests.entry(sm.a).or_default().push((*ctr, sm.plane.normal, sm.id));
-            requests.entry(sm.b).or_default().push((*ctr, -sm.plane.normal, sm.id));
+            let ax = axes.get(&sm.id).copied().unwrap_or(sm.plane.normal);
+            requests.entry(sm.a).or_default().push((*ctr, ax, sm.id));
+            requests.entry(sm.b).or_default().push((*ctr, -ax, sm.id));
         }
     }
     // Placement already checked the walls; this only guards against overlap
     // with other pins' holes being missed (kept for safety and stats).
-    let rejected = reject_pins(&pins, &bvhs, r, depth);
+    let rejected = reject_pins(&pins, &bvhs, &axes, r, depth);
     if std::env::var_os("S3D_TIMING").is_some() {
         let total: usize = pins.iter().map(|x| x.1.len()).sum();
         let empty = pins.iter().filter(|x| x.1.is_empty()).count();
@@ -400,12 +423,14 @@ pub fn contact_width(p: &Partition, s: &Seam) -> f64 {
 /// Share of pins that fit, and share of sizeable cuts that get a pin.
 fn pin_fit_ratio(p: &Partition, bvhs: &HashMap<PieceId, Arc<Bvh>>, cs: &ConnectorSettings) -> (f64, f64) {
     let (r, depth) = (cs.hole_radius(), cs.hole_depth());
+    let axes = pin_axes(p);
     let pins: Vec<(Seam, Vec<DVec3>)> = p
         .seams
         .par_iter()
         .filter(|s| s.area >= MIN_PIN_CONTACT)
         .map(|s| {
-            let fits = |ctr: DVec3| bvhs.get(&s.a).is_some_and(|b| hole_fits(b, ctr, s.plane.normal, r, depth)) && bvhs.get(&s.b).is_some_and(|b| hole_fits(b, ctr, -s.plane.normal, r, depth));
+            let ax = axes.get(&s.id).copied().unwrap_or(s.plane.normal);
+            let fits = |ctr: DVec3| bvhs.get(&s.a).is_some_and(|b| hole_fits(b, ctr, ax, r, depth)) && bvhs.get(&s.b).is_some_and(|b| hole_fits(b, ctr, -ax, r, depth));
             (s.clone(), place_pins_checked(p, s, cs, &fits))
         })
         .collect();
@@ -452,7 +477,14 @@ pub fn suggest_pin_size(p: &Partition, c: &ConnectorSettings) -> Option<PinAdvic
 
 /// All pin positions for the current pieces (for drawing and tests).
 pub fn all_pins(p: &Partition, c: &ConnectorSettings) -> Vec<Pin> {
-    p.seams.iter().flat_map(|s| place_pins(p, s, c).into_iter().map(move |center| Pin { seam: s.id, center, axis: s.plane.normal })).collect()
+    let axes = pin_axes(p);
+    p.seams
+        .iter()
+        .flat_map(|s| {
+            let axis = axes.get(&s.id).copied().unwrap_or(s.plane.normal);
+            place_pins(p, s, c).into_iter().map(move |center| Pin { seam: s.id, center, axis })
+        })
+        .collect()
 }
 
 #[cfg(test)]

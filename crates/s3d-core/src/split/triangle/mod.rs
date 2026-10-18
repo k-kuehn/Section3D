@@ -103,8 +103,8 @@ fn edges_of(rows: &[eval::RowEval]) -> Vec<[Vec3; 2]> {
 /// Runs the search and returns the best layout found.
 pub fn search(mesh: &Mesh, s: &Settings, zones: &Zones, job: &JobCtx, preview: Option<&PreviewFn>) -> SearchResult {
     let started = Instant::now();
-    // The search gets 60% of the time limit; cutting and fixing use the rest.
-    let limit = Duration::from_secs_f32((s.split.time_limit * 0.6).max(1.0));
+    // The search gets half the time limit; cutting and fixing use the rest.
+    let limit = Duration::from_secs_f32((s.split.time_limit * 0.5).max(1.0));
     let usable = s.printer.usable();
     let bed = [usable[0] as f64, usable[1] as f64, usable[2] as f64];
     let theta = (s.split.side_angle as f64).clamp(30.0, 70.0).to_radians();

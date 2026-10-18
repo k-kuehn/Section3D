@@ -17,8 +17,16 @@ pub struct Assembly {
     pub blocked: Vec<PieceId>,
 }
 
+/// Minimum cosine between the insertion direction and every contact face
+/// normal: the piece must approach all placed neighbours at once (it slides
+/// into a slot), never scrape along or move away from a face.
+const MIN_APPROACH: f64 = 0.3;
+
 /// Insertion direction of `c` against already placed pieces, if one exists.
+/// Dowel pins are drilled along this direction, so one straight move seats
+/// every pin.
 fn insertion(p: &Partition, c: PieceId, placed: &[PieceId]) -> (Option<DVec3>, f64) {
+    // Normals of the contact faces, pointing from `c` into its neighbours.
     let mut dirs: Vec<(DVec3, f64)> = Vec::new();
     for s in p.seams_of(c) {
         let o = s.other(c);
@@ -32,12 +40,18 @@ fn insertion(p: &Partition, c: PieceId, placed: &[PieceId]) -> (Option<DVec3>, f
     if dirs.is_empty() {
         return (None, 0.0);
     }
-    let first = dirs[0].0;
-    if dirs.iter().all(|(d, _)| d.dot(first) > 0.996) {
-        let avg = dirs.iter().fold(DVec3::ZERO, |acc, (d, a)| acc + *d * *a).normalize();
-        (Some(avg), area)
-    } else {
-        (None, area)
+    // Try the area-weighted mean, the plain mean, and each face normal.
+    let mut cands: Vec<DVec3> = vec![dirs.iter().fold(DVec3::ZERO, |acc, (d, a)| acc + *d * *a), dirs.iter().fold(DVec3::ZERO, |acc, (d, _)| acc + *d)];
+    cands.extend(dirs.iter().map(|d| d.0));
+    let best = cands
+        .into_iter()
+        .filter(|c| c.length() > 1e-9)
+        .map(|c| c.normalize())
+        .map(|c| (dirs.iter().map(|(d, _)| d.dot(c)).fold(f64::INFINITY, f64::min), c))
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    match best {
+        Some((m, d)) if m >= MIN_APPROACH => (Some(d), area),
+        _ => (None, area),
     }
 }
 
