@@ -9,6 +9,7 @@ pub mod export;
 pub mod hollow;
 pub mod io;
 pub mod job;
+pub mod labels;
 pub mod manifold;
 pub mod march;
 pub mod mesh;

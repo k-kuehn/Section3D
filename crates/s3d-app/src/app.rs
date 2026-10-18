@@ -19,7 +19,8 @@ pub enum JobOut {
     Hollowed(Hollow),
     Split(SplitState, Vec<EditStatus>),
     /// Result of an incremental edit or connector update.
-    Updated { partition: Partition, edits: Vec<EditOp>, status: Vec<EditStatus>, conn_key: Option<u64>, changed: Vec<PieceId> },
+    /// `pin_advice`: Some(new advice) when connectors were redone for all pieces.
+    Updated { partition: Partition, edits: Vec<EditOp>, status: Vec<EditStatus>, conn_key: Option<u64>, changed: Vec<PieceId>, pin_advice: Option<Option<s3d_core::connectors::PinAdvice>> },
     /// A seam adjustment preview (not yet applied).
     Preview(view::Preview),
     Exported(String),
@@ -182,7 +183,8 @@ impl S3dApp {
             let mut partition = out.partition;
             let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
             s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
-            Ok(JobOut::Split(SplitState { partition, key, conn_key: Some(conn_key), generation: 0 }, out.edit_status))
+            let pin_advice = pin_advice(&partition, &settings);
+            Ok(JobOut::Split(SplitState { partition, key, conn_key: Some(conn_key), generation: 0, pin_advice }, out.edit_status))
         });
     }
 
@@ -198,7 +200,8 @@ impl S3dApp {
             let mut partition = split.partition.clone();
             let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
             s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
-            Ok(JobOut::Updated { partition, edits, status, conn_key: Some(conn_key), changed: all })
+            let advice = pin_advice(&partition, &settings);
+            Ok(JobOut::Updated { partition, edits, status, conn_key: Some(conn_key), changed: all, pin_advice: Some(advice) })
         });
     }
 
@@ -239,7 +242,7 @@ impl S3dApp {
             }
             edits.push(op);
             status.push(st);
-            Ok(JobOut::Updated { partition, edits, status, conn_key: conn, changed: touched })
+            Ok(JobOut::Updated { partition, edits, status, conn_key: conn, changed: touched, pin_advice: None })
         });
     }
 
@@ -328,13 +331,14 @@ impl S3dApp {
                 });
                 self.view.arrange_needed = true;
             }
-            JobOut::Updated { partition, edits, status, conn_key, changed } => {
+            JobOut::Updated { partition, edits, status, conn_key, changed, pin_advice } => {
                 let Some(old) = &self.doc.split else { return };
                 let generation = old.generation;
+                let pin_advice = pin_advice.unwrap_or(old.pin_advice);
                 self.doc.edits = edits;
                 self.doc.edit_status = status;
                 let key = self.doc.split_key();
-                self.doc.split = Some(Arc::new(SplitState { partition, key, conn_key, generation }));
+                self.doc.split = Some(Arc::new(SplitState { partition, key, conn_key, generation, pin_advice }));
                 self.doc.dirty = true;
                 self.view.on_pieces_changed(&changed);
                 self.view.arrange_needed = true;
@@ -726,6 +730,15 @@ impl S3dApp {
     pub fn restore_snapshot(&mut self, s: Snapshot) {
         self.doc.restore(s);
     }
+}
+
+/// Pin size advice, only when some pins had to be skipped.
+fn pin_advice(p: &Partition, s: &s3d_core::settings::Settings) -> Option<s3d_core::connectors::PinAdvice> {
+    let skipped = p.pieces.iter().any(|q| q.flags.contains(&s3d_core::partition::Flag::SkippedDowel));
+    if !s.connectors.dowels || !skipped {
+        return None;
+    }
+    s3d_core::connectors::suggest_pin_size(p, &s.connectors).filter(|a| a.diameter < s.connectors.diameter || a.length < s.connectors.length)
 }
 
 /// Joined button group.

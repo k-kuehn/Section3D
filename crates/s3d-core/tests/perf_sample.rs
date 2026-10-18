@@ -54,7 +54,28 @@ fn grid_split_sample() {
         &job,
     )
     .unwrap();
-    let p = &out.partition;
-    let flagged = p.pieces.iter().filter(|q| !q.flags.is_empty()).count();
-    eprintln!("grid: {} pieces, {} seams, {} flagged, in {:?}", p.pieces.len(), p.seams.len(), flagged, t.elapsed());
+    let mut part = out.partition;
+    eprintln!("grid split: {} pieces, {} seams in {:?}", part.pieces.len(), part.seams.len(), t.elapsed());
+    let t2 = Instant::now();
+    let ids: Vec<u32> = part.pieces.iter().map(|q| q.id).collect();
+    let mut st = s3d_core::settings::Settings::default();
+    st.printer.printer = s3d_core::printers::Printer::new("X1C", 256.0, 256.0, 256.0);
+    st.connectors.diameter = std::env::var("S3D_PIN").ok().and_then(|v| v.parse().ok()).unwrap_or(6.0);
+    st.connectors.length = std::env::var("S3D_PINLEN").ok().and_then(|v| v.parse().ok()).unwrap_or(30.0);
+    s3d_core::connectors::finish(&mut part, &ids, &st, &job).unwrap();
+    let flagged = part.pieces.iter().filter(|q| !q.flags.is_empty()).count();
+    let skipped = part.pieces.iter().filter(|q| q.flags.contains(&s3d_core::partition::Flag::SkippedDowel)).count();
+    eprintln!("connectors: {:?}; {} flagged, {} with skipped pins", t2.elapsed(), flagged, skipped);
+    let mut kinds = std::collections::BTreeMap::new();
+    for q in &part.pieces {
+        for f in &q.flags {
+            *kinds.entry(f.short()).or_insert(0) += 1;
+        }
+    }
+    eprintln!("flags: {kinds:?}");
+    let mut widths: Vec<f64> = part.seams.iter().map(|s| s3d_core::connectors::contact_width(&part, s)).collect();
+    widths.sort_by(|a, b| a.total_cmp(b));
+    let q = |f: f64| widths[((widths.len() - 1) as f64 * f) as usize];
+    eprintln!("suggested pin diameter: {:?}", s3d_core::connectors::suggest_pin_size(&part, &st.connectors));
+    eprintln!("seam contact widths mm: min {:.1} p25 {:.1} median {:.1} p75 {:.1} max {:.1}", q(0.0), q(0.25), q(0.5), q(0.75), q(1.0));
 }

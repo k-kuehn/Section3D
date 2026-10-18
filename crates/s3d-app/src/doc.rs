@@ -66,6 +66,8 @@ pub struct SplitState {
     pub conn_key: Option<u64>,
     /// Distinguishes GPU mesh ids across results.
     pub generation: u64,
+    /// Smaller pin size to suggest when pins had to be skipped.
+    pub pin_advice: Option<s3d_core::connectors::PinAdvice>,
 }
 
 impl SplitState {

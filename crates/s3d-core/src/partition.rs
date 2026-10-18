@@ -152,7 +152,7 @@ pub struct Partition {
 
 /// Cap triangles of a mesh lying on a plane, in the plane's 2D frame.
 /// `outward_sign` is +1 for faces whose normal equals the plane normal.
-fn caps_on(mesh: &Mesh, plane: &Plane, outward_sign: f64) -> Vec<[DVec2; 3]> {
+pub fn caps_on(mesh: &Mesh, plane: &Plane, outward_sign: f64) -> Vec<[DVec2; 3]> {
     let (u, v) = plane.basis();
     let tol = ON_PLANE.max(mesh.bbox().diagonal() as f64 * 1e-7);
     (0..mesh.tris.len())
@@ -188,7 +188,7 @@ fn point_in_tri(p: DVec2, t: &[DVec2; 3]) -> bool {
 }
 
 /// Uniform-grid lookup over a set of 2D triangles.
-struct TriGrid {
+pub struct TriGrid {
     tris: Vec<[DVec2; 3]>,
     min: DVec2,
     cell: f64,
@@ -198,7 +198,7 @@ struct TriGrid {
 }
 
 impl TriGrid {
-    fn new(tris: Vec<[DVec2; 3]>) -> TriGrid {
+    pub fn new(tris: Vec<[DVec2; 3]>) -> TriGrid {
         let mut min = DVec2::splat(f64::INFINITY);
         let mut max = DVec2::splat(f64::NEG_INFINITY);
         for t in &tris {
@@ -227,7 +227,7 @@ impl TriGrid {
         TriGrid { tris, min, cell, nx, ny, cells }
     }
 
-    fn contains(&self, p: DVec2) -> bool {
+    pub fn contains(&self, p: DVec2) -> bool {
         let q = (p - self.min) / self.cell;
         if q.x < 0.0 || q.y < 0.0 {
             return false;
@@ -458,6 +458,7 @@ pub fn dedup_planes(it: impl Iterator<Item = Plane>) -> Vec<Plane> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::DVec3;
 
     fn cube(s: f64) -> Solid {
         Solid::cube(DVec3::splat(s), false).unwrap()

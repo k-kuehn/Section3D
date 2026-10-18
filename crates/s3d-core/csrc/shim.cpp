@@ -174,7 +174,7 @@ S3dMf* s3d_mf_sphere(double r, int segments) {
 
 // xy: packed points of all contours; sizes: point count per contour.
 S3dMf* s3d_mf_extrude(const double* xy, const uint32_t* sizes, uint32_t ncontours,
-                      double height) {
+                      double height, double scale_top) {
   GUARD(
       {
         Polygons polys;
@@ -185,7 +185,7 @@ S3dMf* s3d_mf_extrude(const double* xy, const uint32_t* sizes, uint32_t ncontour
           for (uint32_t i = 0; i < sizes[c]; ++i, ++k) p.push_back(vec2(xy[k * 2], xy[k * 2 + 1]));
           polys.push_back(std::move(p));
         }
-        return wrap(Manifold::Extrude(polys, height));
+        return wrap(Manifold::Extrude(polys, height, 0, 0.0, vec2(scale_top, scale_top)));
       },
       nullptr)
 }

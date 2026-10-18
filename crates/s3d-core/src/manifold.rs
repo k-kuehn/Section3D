@@ -47,7 +47,7 @@ unsafe extern "C" {
     fn s3d_mf_cube(x: f64, y: f64, z: f64, center: i32) -> *mut RawMf;
     fn s3d_mf_cylinder(h: f64, r_low: f64, r_high: f64, segments: i32, center: i32) -> *mut RawMf;
     fn s3d_mf_sphere(r: f64, segments: i32) -> *mut RawMf;
-    fn s3d_mf_extrude(xy: *const f64, sizes: *const u32, n: u32, height: f64) -> *mut RawMf;
+    fn s3d_mf_extrude(xy: *const f64, sizes: *const u32, n: u32, height: f64, scale_top: f64) -> *mut RawMf;
     fn s3d_mf_hull(h: *const RawMf) -> *mut RawMf;
     fn s3d_mf_hull_points(pts: *const f64, n: u32) -> *mut RawMf;
     fn s3d_mf_simplify(h: *const RawMf, tol: f64) -> *mut RawMf;
@@ -292,11 +292,16 @@ impl Solid {
         Solid::wrap(unsafe { s3d_mf_sphere(r, segments) }, "sphere")
     }
 
-    /// Extrudes 2D contours (outer CCW, holes CW; even-odd fill) along +Z.
+    /// Extrudes 2D contours (outer CCW, holes CW) along +Z.
     pub fn extrude(contours: &[Vec<glam::DVec2>], height: f64) -> GResult<Solid> {
+        Self::extrude_scaled(contours, height, 1.0)
+    }
+
+    /// Extrudes with the top scaled by `scale_top` (0 makes a pyramid/cone).
+    pub fn extrude_scaled(contours: &[Vec<glam::DVec2>], height: f64, scale_top: f64) -> GResult<Solid> {
         let sizes: Vec<u32> = contours.iter().map(|c| c.len() as u32).collect();
         let xy: Vec<f64> = contours.iter().flatten().flat_map(|p| [p.x, p.y]).collect();
-        Solid::wrap(unsafe { s3d_mf_extrude(xy.as_ptr(), sizes.as_ptr(), sizes.len() as u32, height) }, "extrude")
+        Solid::wrap(unsafe { s3d_mf_extrude(xy.as_ptr(), sizes.as_ptr(), sizes.len() as u32, height, scale_top) }, "extrude")
     }
 
     pub fn hull(&self) -> GResult<Solid> {

@@ -347,6 +347,22 @@ fn connectors(app: &mut S3dApp, ui: &mut Ui) {
     } else if app.status(Step::Connectors) == Status::Stale && stale_banner(app, ui, "Connector settings changed.") {
         app.start_connectors();
     }
+    if let Some(a) = app.doc.split.as_ref().and_then(|s| s.pin_advice) {
+        let p = app.palette();
+        let skipped = app.doc.split.as_ref().map(|s| s.partition.pieces.iter().filter(|q| q.flags.contains(&s3d_core::partition::Flag::SkippedDowel)).count()).unwrap_or(0);
+        let mut apply = false;
+        egui::Frame::new().fill(p.info.gamma_multiply(0.12)).stroke(Stroke::new(1.0, p.info.gamma_multiply(0.6))).corner_radius(CornerRadius::same(7)).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(format!("Walls are too thin for these pins on {skipped} pieces.")).color(p.text_strong));
+            ui.label(RichText::new(format!("{:.0} × {:.0} mm pins fit on about {:.0}% of cuts.", a.diameter, a.length, a.coverage * 100.0)).color(p.text));
+            apply = ui.add_enabled(!busy, egui::Button::new(format!("Use {:.0} × {:.0} mm pins", a.diameter, a.length))).clicked();
+        });
+        if apply {
+            app.doc.settings.connectors.diameter = a.diameter;
+            app.doc.settings.connectors.length = a.length;
+            app.start_connectors();
+        }
+    }
     card(ui, |ui| {
         section_title(ui, "Dowel pins");
         let c = &mut app.doc.settings.connectors;

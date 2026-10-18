@@ -50,7 +50,7 @@ impl Loaded {
         }
         if let Some(s) = d.split {
             let generation = doc.new_id();
-            doc.split = Some(Arc::new(SplitState { partition: s.partition, key: s.key, conn_key: s.conn_key, generation }));
+            doc.split = Some(Arc::new(SplitState { partition: s.partition, key: s.key, conn_key: s.conn_key, generation, pin_advice: None }));
         }
         doc.extra_view = Some(d.extra);
         // Autosave copies are not the user's file.
