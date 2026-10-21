@@ -478,13 +478,22 @@ fn grid_editor_attention_and_better_cut() {
     // Find a better cut: the slice is merged with a neighbour and re-cut.
     h.state_mut().view.select(Some(sliver));
     h.step();
-    // Even with a piece's card open, the list shows at least ten rows.
+    // The parts list over the 3D view shows at least ten rows, and folds
+    // down to its heading.
     h.state_mut().view.attention = false;
     h.run_steps(3);
     assert!(part.pieces.len() >= 10);
+    shot(&mut h, "07b_selected_and_list");
     let rows = h.query_all_by_label_contains("Part #").count();
     assert!(rows >= 10, "{rows} rows showing");
-    shot(&mut h, "07b_selected_and_list");
+    h.get_by_label("Collapse parts").click();
+    h.run_steps(3);
+    assert!(h.state().recent.parts_collapsed);
+    assert_eq!(h.query_all_by_label_contains("Part #").count(), 0, "collapsed list shows no rows");
+    shot(&mut h, "07c_list_collapsed");
+    h.get_by_label("Expand parts").click();
+    h.run_steps(3);
+    assert!(h.query_all_by_label_contains("Part #").count() >= 10);
     h.get_by_label("Find a better cut").scroll_to_me();
     h.run_steps(3);
     h.get_by_label("Find a better cut").click();

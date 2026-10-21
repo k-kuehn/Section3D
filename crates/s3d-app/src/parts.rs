@@ -1,4 +1,5 @@
-//! Parts list and the selected piece's properties (cuts, flags, actions).
+//! Parts list (over the 3D view) and the selected piece's properties (cuts,
+//! flags, actions).
 
 use eframe::egui;
 use egui::{Color32, CornerRadius, RichText, Stroke, Ui, Vec2};
@@ -7,7 +8,7 @@ use s3d_core::partition::{Flag, Partition, PieceId};
 
 use crate::app::S3dApp;
 use crate::theme::{self, Palette};
-use crate::widgets::{self, card, section_title};
+use crate::widgets::{self, card};
 
 pub fn flag_color(p: &Palette, f: &Flag) -> Color32 {
     match f {
@@ -65,61 +66,106 @@ pub fn needs_attention(q: &s3d_core::partition::Piece) -> bool {
 }
 
 const ROW_H: f32 = 30.0;
-/// Height of the parts card with ten rows showing (heading, a note line,
-/// rows and margins).
-pub const LIST_MIN: f32 = ROW_H * 10.0 + 140.0;
+/// Width of the parts list over the 3D view.
+const LIST_W: f32 = 360.0;
 
-pub fn list(app: &mut S3dApp, ui: &mut Ui) {
-    let Some(split) = app.doc.split.clone() else { return };
+/// Parts list: a see-through panel over the right side of the 3D view
+/// (`view`), folded down to its heading when collapsed.
+pub fn overlay(app: &mut S3dApp, ui: &mut Ui, view: egui::Rect) {
+    if app.doc.split.is_none() {
+        return;
+    }
     let p = app.palette();
+    let width = LIST_W.min(view.width() * 0.5);
+    let area = egui::Rect::from_min_max(egui::pos2(view.right() - width - 14.0, view.top() + 10.0), view.right_bottom() - Vec2::new(14.0, 10.0));
+    egui::Area::new(egui::Id::unique("parts_overlay")).order(egui::Order::Middle).fixed_pos(area.min).constrain_to(area).show(ui.ctx(), |ui| {
+        egui::Frame::new()
+            .fill(p.card.gamma_multiply(0.62))
+            .stroke(Stroke::new(1.0, p.card_stroke))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                // Inside the margins and the border.
+                ui.set_width(area.width() - 24.0);
+                list(app, ui, area.bottom() - 10.0, &p);
+            });
+    });
+}
+
+/// The list's heading and, unless collapsed, its rows down to `bottom`.
+fn list(app: &mut S3dApp, ui: &mut Ui, bottom: f32, p: &Palette) {
+    let Some(split) = app.doc.split.clone() else { return };
     let part = &split.partition;
     let flagged = part.pieces.iter().filter(|q| needs_attention(q)).count();
     if flagged == 0 {
         app.view.attention = false;
     }
-    let mut order: Vec<usize> = (0..part.pieces.len()).filter(|&i| !app.view.attention || needs_attention(&part.pieces[i])).collect();
-    // Worst problems first, then by number.
-    let worst = |q: &s3d_core::partition::Piece| q.flags.iter().map(severity).min().unwrap_or(10);
-    order.sort_by_key(|&i| (worst(&part.pieces[i]), part.pieces[i].label));
     let pins = part.pieces.iter().filter(|q| q.flags.contains(&Flag::SkippedDowel)).count();
-    card(ui, |ui| {
-        ui.horizontal(|ui| {
-            section_title(ui, "Parts");
-            ui.label(RichText::new(format!("{} pieces", part.pieces.len())).color(p.text_strong));
+    let open = !app.recent.parts_collapsed;
+    ui.horizontal(|ui| {
+        // The chevron and the title fold the list.
+        let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, if open { "Collapse parts" } else { "Expand parts" }));
+        let resp = resp.on_hover_text(if open { "Collapse the parts list" } else { "Expand the parts list" });
+        let c = r.center();
+        let pts = if open {
+            vec![c + Vec2::new(-5.0, -3.0), c + Vec2::new(5.0, -3.0), c + Vec2::new(0.0, 3.5)]
+        } else {
+            vec![c + Vec2::new(-3.0, -5.0), c + Vec2::new(3.5, 0.0), c + Vec2::new(-3.0, 5.0)]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(pts, if resp.hovered() { p.text_strong } else { p.text }, Stroke::NONE));
+        let title = ui.add(egui::Label::new(RichText::new("PARTS").size(12.0).strong().color(p.text_weak)).sense(egui::Sense::click()));
+        if resp.clicked() || title.clicked() {
+            app.recent.parts_collapsed = open;
+            app.recent.save();
+        }
+        ui.label(RichText::new(format!("{} pieces", part.pieces.len())).color(p.text_strong));
+        widgets::right(ui, |ui| {
+            if !app.view.hidden.is_empty() || app.view.isolate.is_some() {
+                if ui.small_button("Show all").clicked() {
+                    app.view.show_all();
+                }
+            }
+        });
+    });
+    if flagged > 0 || pins > 0 {
+        ui.horizontal_wrapped(|ui| {
             if flagged > 0 {
                 let r = widgets::badge_button(ui, &format!("{flagged} NEED ATTENTION"), p.warn, app.view.attention);
                 if r.on_hover_text(if app.view.attention { "Show all pieces" } else { "List only these pieces, worst first" }).clicked() {
                     app.view.attention = !app.view.attention;
+                    app.recent.parts_collapsed = false;
                 }
             }
             if pins > 0 {
                 widgets::badge(ui, &format!("PINS SKIPPED ON {pins}"), p.info).on_hover_text("Walls are too thin for the dowel pins on these pieces. See the Features step.");
             }
-            widgets::right(ui, |ui| {
-                if !app.view.hidden.is_empty() || app.view.isolate.is_some() {
-                    if ui.small_button("Show all").clicked() {
-                        app.view.show_all();
-                    }
-                }
-            });
         });
-        if app.view.attention {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Showing the {flagged} pieces that need attention, worst first.")).color(p.text_weak).size(12.5));
-                if ui.link("Show all").clicked() {
-                    app.view.attention = false;
-                }
-            });
-        }
-        ui.add_space(4.0);
-        // Fill the rest of the panel (sized for at least ten rows).
-        let room = (ui.available_height() - 4.0).max(ROW_H * 10.0);
-        egui::ScrollArea::vertical().id_salt("parts").max_height(room).auto_shrink([false, false]).show_rows(ui, ROW_H, order.len(), |ui, range| {
-            for &i in &order[range] {
-                let q = &part.pieces[i];
-                row(app, ui, part, q.id, ROW_H, &p);
+    }
+    if app.recent.parts_collapsed {
+        return;
+    }
+    if app.view.attention {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("Showing the {flagged} pieces that need attention, worst first.")).color(p.text_weak).size(12.5));
+            if ui.link("Show all").clicked() {
+                app.view.attention = false;
             }
         });
+    }
+    let mut order: Vec<usize> = (0..part.pieces.len()).filter(|&i| !app.view.attention || needs_attention(&part.pieces[i])).collect();
+    // Worst problems first, then by number.
+    let worst = |q: &s3d_core::partition::Piece| q.flags.iter().map(severity).min().unwrap_or(10);
+    order.sort_by_key(|&i| (worst(&part.pieces[i]), part.pieces[i].label));
+    ui.add_space(4.0);
+    // Down to the bottom of the view; shorter when there are few pieces.
+    let rows = order.len() as f32 * (ROW_H + ui.spacing().item_spacing.y);
+    let room = (bottom - ui.cursor().top() - 10.0).max(ROW_H * 3.0).min(rows);
+    egui::ScrollArea::vertical().id_salt("parts").min_scrolled_height(room).max_height(room).auto_shrink([false, false]).show_rows(ui, ROW_H, order.len(), |ui, range| {
+        for &i in &order[range] {
+            let q = &part.pieces[i];
+            row(app, ui, part, q.id, ROW_H, p);
+        }
     });
 }
 

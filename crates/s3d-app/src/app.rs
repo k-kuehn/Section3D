@@ -702,6 +702,8 @@ impl S3dApp {
             let flagged = self.doc.split.as_ref().map(|s| s.partition.pieces.iter().filter(|q| crate::parts::needs_attention(q)).count()).unwrap_or(0);
             if flagged > 0 && !self.view.attention && ui.link(format!("List the {flagged} that need attention")).clicked() {
                 self.view.attention = true;
+                self.view.tab = crate::view::Tab::Model;
+                self.recent.parts_collapsed = false;
                 if !matches!(self.step, Step::Split | Step::Features | Step::Export) {
                     self.step = Step::Split;
                 }

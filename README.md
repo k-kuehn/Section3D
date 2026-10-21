@@ -16,7 +16,7 @@ Download it from [Releases](https://github.com/k-kuehn/Section3D/releases).
 | ![Pieces pulled apart](docs/screenshots/exploded.png) | ![A part number on a piece](docs/screenshots/number.png) |
 | Explode the split to see every piece. | Each piece carries its number, raised or cut in. |
 | ![Selected piece and parts list](docs/screenshots/selected.png) | ![Grid cut editor](docs/screenshots/grid.png) |
-| Select a piece to see its size, neighbours and flags. | Grid mode: set the cuts along each axis. |
+| Select a piece to see its size, neighbours and flags; the parts list floats over the view. | Grid mode: set the cuts along each axis. |
 | ![Pieces packed onto beds](docs/screenshots/beds.png) | ![Assembly view](docs/screenshots/assembly.png) |
 | Pieces packed onto as few beds as possible. | The assembly view builds the model up step by step. |
 
@@ -45,9 +45,10 @@ Set your printer's build volume by clicking its size in the top bar (the default
      out of the paint; Grid flags pieces cut through it.
    - **Select pieces**: click a piece to see its size, neighbours and flags; its edges are outlined. *Shift*-click (or
      *Ctrl*-click) adds or removes pieces, in the 3D view or the parts list; *Merge* joins a touching group into one
-     piece. Click the *N need attention* badge to list only the pieces with problems, worst first. The parts list keeps
-     the bottom of the panel (at least ten rows) with the step's main button above it; the selected piece's card and
-     the step's settings scroll above those.
+     piece. Click the *N need attention* badge to list only the pieces with problems, worst first. The parts list sits
+     over the right side of the 3D view, see-through so the model shows behind it; click its arrow (or *Parts*) to fold
+     it to its heading. The selected piece's card and the step's settings are in the left panel, with the step's main
+     button pinned at the bottom.
    - **Right-click** a group of selected pieces to *Merge* them. Right-click a single piece for *Split* (*Draw a cut
      line…*, *Split in two automatically*, *Find a better cut automatically*), *Move number to the other side*,
      *Isolate*, *Isolate with neighbours*, *Hide* or *Show all*.
@@ -75,7 +76,7 @@ Set your printer's build volume by clicking its size in the top bar (the default
 
 The **Assembly** tab, guide and viewer build the model up in sections: each step joins two parts (single pieces
 first, then small sections into larger ones) along their seam, with the seam length and a rough count of heat
-staples. The part being added is highlighted in place among the others, its outline slowly pulsing. The HTML viewer shows the pieces at full
+staples. The part being added is highlighted in place among the others, with a dark-edged outline that slowly pulses from orange to white. The HTML viewer shows the pieces at full
 detail with smooth shading.
 
 The 3D views (model and beds) switch between *Perspective* and *Isometric* (parallel) projection.

@@ -1,5 +1,5 @@
-//! Left panel: step tabs, each step's settings card and action button, the
-//! parts list and the selected piece's properties.
+//! Left panel: step tabs, each step's settings card and action button, and
+//! the selected piece's properties.
 
 use eframe::egui;
 use egui::{Color32, CornerRadius, RichText, Stroke, Ui, Vec2};
@@ -16,11 +16,10 @@ pub fn show(app: &mut S3dApp, ui: &mut Ui) {
     ui.add_space(10.0);
     let pinned = matches!(app.step, Step::Split | Step::Features | Step::Export);
     let parts = app.doc.split.is_some() && pinned;
-    // The parts list keeps the bottom of the panel, at least ten rows, with
-    // the step's button above it; the selected piece's card and the step's
-    // settings scroll above those.
-    let below = if parts { parts::LIST_MIN } else { 0.0 } + if pinned { 56.0 } else { 0.0 };
-    egui::ScrollArea::vertical().auto_shrink([false, parts]).max_height((ui.available_height() - below).max(80.0)).show(ui, |ui| {
+    // The step's button keeps the bottom of the panel; the selected piece's
+    // card and the step's settings scroll above it.
+    let below = if pinned { 56.0 } else { 0.0 };
+    egui::ScrollArea::vertical().auto_shrink([false, false]).max_height((ui.available_height() - below).max(80.0)).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 10.0;
         if parts {
             // A newly picked piece's card comes into view.
@@ -42,10 +41,6 @@ pub fn show(app: &mut S3dApp, ui: &mut Ui) {
     if pinned {
         ui.add_space(10.0);
         action(app, ui);
-    }
-    if parts {
-        ui.add_space(10.0);
-        parts::list(app, ui);
     }
 }
 

@@ -609,13 +609,16 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
         // added highlighted; everything else faint for context.
         let step = assembly.as_ref().and_then(|a| a.steps.get(app.view.assembly_step.min(a.steps.len())).cloned());
         let numbers = app.view.show_numbers && app.view.tab == Tab::Model;
-        // The joining part's outline pulses slowly in the assembly view.
-        let outline = if assembly.is_some() {
+        // Outline layers, drawn in order. In the assembly view the joining
+        // part gets a dark halo under a line that pulses slowly from the
+        // accent to near white, so it stands out on any piece colour.
+        let outline: Vec<([f32; 4], f32)> = if assembly.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
             let k = pulse(ui.input(|i| i.time));
-            (rgba(p.accent, 0.3 + 0.7 * k), 1.5 + 2.0 * k)
+            let core = widgets::lerp_color(p.accent, Color32::from_rgb(0xFF, 0xF4, 0xE8), 0.75 * k);
+            vec![([0.0, 0.0, 0.0, 0.85], 5.0 + 2.0 * k), (rgba(core, 1.0), 2.5 + k)]
         } else {
-            (rgba(p.accent, 1.0), 2.0)
+            vec![(rgba(p.accent, 1.0), 2.0)]
         };
         let ink = if p.dark { [0.06, 0.07, 0.09, 0.95] } else { [0.10, 0.11, 0.14, 0.95] };
         for q in &part.pieces {
@@ -664,7 +667,9 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
                 planes,
             });
             if flags & FLAG_SELECTED != 0 {
-                app.view.outline_edges(mesh_id, q.display_mesh(), model, outline.0, outline.1, &mut frame.lines);
+                for &(color, width) in &outline {
+                    app.view.outline_edges(mesh_id, q.display_mesh(), model, color, width, &mut frame.lines);
+                }
             }
             if numbers && q.finished.is_some() {
                 // Only numbers big enough on screen to read (tiny ones would
@@ -958,6 +963,9 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
 
     app.view.viewport.paint(ui, rect, frame);
     overlays(app, ui, rect, p);
+    if show_pieces && app.view.tab == Tab::Model {
+        parts::overlay(app, ui, rect);
+    }
 }
 
 /// Cuts a piece along a line the user drew: the stroke is fitted with a

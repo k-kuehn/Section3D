@@ -1,4 +1,5 @@
-//! Small persistent app config: recent projects, theme and projection.
+//! Small persistent app config: recent projects, theme, projection and
+//! whether the parts list is collapsed.
 //!
 //! Stored in `%APPDATA%\Section3D\config.json`, or next to the executable when
 //! a file named `portable` sits beside it.
@@ -14,11 +15,13 @@ pub struct Recent {
     pub dark: bool,
     /// 3D views use a parallel (isometric) projection.
     pub ortho: bool,
+    /// The parts list over the 3D view is folded to its heading.
+    pub parts_collapsed: bool,
 }
 
 impl Default for Recent {
     fn default() -> Self {
-        Recent { projects: Vec::new(), dark: true, ortho: false }
+        Recent { projects: Vec::new(), dark: true, ortho: false, parts_collapsed: false }
     }
 }
 
