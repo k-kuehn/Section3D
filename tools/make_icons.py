@@ -1,4 +1,4 @@
-"""Rasterises section3d-icon-dark.svg (polygons only) to PNG/ICO with Pillow.
+"""Rasterises assets/section3d-icon-dark.svg (polygons only) to PNG/ICO with Pillow.
 
 Usage: python tools/make_icons.py
 """
@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent.parent
-svg = (ROOT / "section3d-icon-dark.svg").read_text()
+svg = (ROOT / "assets" / "section3d-icon-dark.svg").read_text()
 view = 512.0
 ss = 4  # supersampling
 

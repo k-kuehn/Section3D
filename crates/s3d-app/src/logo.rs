@@ -1,6 +1,7 @@
 //! The Section3D logo, drawn with egui shapes (no SVG renderer needed).
 //! Geometry copied from section3d-logo-*.svg (820 x 240 viewBox).
 
+use eframe::egui;
 use egui::{Color32, Pos2, Rect, RichText, Shape, Stroke, Ui, Vec2, pos2, vec2};
 
 use crate::theme;

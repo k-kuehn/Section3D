@@ -5,6 +5,7 @@ pub mod renderer;
 
 use std::sync::Arc;
 
+use eframe::{egui, egui_wgpu};
 use egui::{Rect, Sense, Ui};
 use glam::{Vec2, Vec3};
 
@@ -134,6 +135,7 @@ impl Viewport {
         frame.size_px = [(rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32];
         frame.view_proj = self.camera.view_proj(self.aspect);
         frame.eye = self.camera.eye();
+        frame.line_bias = self.camera.line_bias();
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, renderer::ViewportCallback { frame: Arc::new(frame) }));
     }
 }

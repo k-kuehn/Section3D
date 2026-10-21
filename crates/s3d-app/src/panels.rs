@@ -1,9 +1,9 @@
 //! Left panel: step tabs, each step's settings card and action button, the
 //! parts list and the selected piece's properties.
 
+use eframe::egui;
 use egui::{Color32, CornerRadius, RichText, Stroke, Ui, Vec2};
-use s3d_core::edits::EditStatus;
-use s3d_core::settings::{LabelMode, SplitMode};
+use s3d_core::settings::{LabelFace, LabelMode, SplitMode};
 
 use crate::app::S3dApp;
 use crate::doc::{Status, Step};
@@ -14,20 +14,39 @@ use crate::{parts, view};
 pub fn show(app: &mut S3dApp, ui: &mut Ui) {
     step_tabs(app, ui);
     ui.add_space(10.0);
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    let pinned = matches!(app.step, Step::Split | Step::Features | Step::Export);
+    let parts = app.doc.split.is_some() && pinned;
+    // The parts list keeps the bottom of the panel, at least ten rows, with
+    // the step's button above it; the selected piece's card and the step's
+    // settings scroll above those.
+    let below = if parts { parts::LIST_MIN } else { 0.0 } + if pinned { 56.0 } else { 0.0 };
+    egui::ScrollArea::vertical().auto_shrink([false, parts]).max_height((ui.available_height() - below).max(80.0)).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 10.0;
+        if parts {
+            // A newly picked piece's card comes into view.
+            let shown = egui::Id::unique("selected_card_for");
+            if ui.ctx().data(|d| d.get_temp::<Option<u32>>(shown)) != Some(app.view.selected) {
+                ui.ctx().data_mut(|d| d.insert_temp(shown, app.view.selected));
+                ui.scroll_to_cursor(Some(egui::Align::TOP));
+            }
+            parts::selected_card(app, ui);
+        }
         match app.step {
             Step::Import => import(app, ui),
             Step::Prepare => prepare(app, ui),
             Step::Split => split(app, ui),
-            Step::Connectors => connectors(app, ui),
+            Step::Features => features(app, ui),
             Step::Export => export(app, ui),
         }
-        if app.doc.split.is_some() && matches!(app.step, Step::Split | Step::Connectors | Step::Export) {
-            parts::selected_card(app, ui);
-            parts::list(app, ui);
-        }
     });
+    if pinned {
+        ui.add_space(10.0);
+        action(app, ui);
+    }
+    if parts {
+        ui.add_space(10.0);
+        parts::list(app, ui);
+    }
 }
 
 fn status_color(p: &Palette, s: Status) -> Color32 {
@@ -228,14 +247,14 @@ fn prepare(app: &mut S3dApp, ui: &mut Ui) {
 
 fn split(app: &mut S3dApp, ui: &mut Ui) {
     let p = app.palette();
-    let busy = app.jobs.busy();
     if app.status(Step::Split) == Status::Stale && stale_banner(app, ui, "Settings changed since the last split.") {
         app.start_split();
     }
     card(ui, |ui| {
         section_title(ui, "Split");
         let s = &mut app.doc.settings.split;
-        setting(ui, "Mode", "split.mode", |ui| widgets::segmented(ui, &mut s.mode, &[(SplitMode::Triangle, "Triangle"), (SplitMode::Grid, "Grid")]));
+        setting(ui, "Mode", "split.mode", |ui| widgets::segmented(ui, &mut s.mode, &[(SplitMode::Shatter, "Shatter"), (SplitMode::Grid, "Grid")]));
+        let shatter = s.mode == SplitMode::Shatter;
         ui.add_space(2.0);
         setting_grid(ui, "split", 2, |ui| {
             setting(ui, "Piece size", "split.target_size", |ui| {
@@ -245,22 +264,31 @@ fn split(app: &mut S3dApp, ui: &mut Ui) {
                         max = !max;
                         let bed = app.doc.settings.printer.usable();
                         s.target_size = if max { None } else { Some(bed[0].min(bed[1]).round()) };
+                        // Grid cuts follow the piece size until moved by hand.
+                        s.grid = None;
                     }
                     if let Some(t) = &mut s.target_size {
-                        num(ui, t, "mm", 20.0..=2000.0, 0);
+                        if num(ui, t, "mm", 20.0..=2000.0, 0).changed() {
+                            s.grid = None;
+                        }
                     }
                 });
             });
             setting(ui, "Smallest piece", "split.min_piece", |ui| num(ui, &mut s.min_piece, "mm", 0.0..=200.0, 0));
             ui.end_row();
             setting(ui, "Overhang limit", "split.overhang", |ui| num(ui, &mut s.overhang, "°", 20.0..=80.0, 0));
-            if s.mode == SplitMode::Triangle {
-                setting(ui, "Search time", "split.time_limit", |ui| num(ui, &mut s.time_limit, "s", 2.0..=600.0, 0));
-                ui.end_row();
-                setting(ui, "Side angle", "split.side_angle", |ui| num(ui, &mut s.side_angle, "°", 45.0..=60.0, 0));
+            if shatter {
+                setting(ui, "Max split time", "split.time_limit", |ui| num(ui, &mut s.time_limit, "s", 2.0..=600.0, 0));
             }
             ui.end_row();
+            setting(ui, "Thinnest part", "split.min_thickness", |ui| num(ui, &mut s.min_thickness, "mm", 0.0..=100.0, 0));
+            setting(ui, "Sharpest corner", "split.min_angle", |ui| num(ui, &mut s.min_angle, "°", 5.0..=60.0, 0));
+            ui.end_row();
         });
+        if !shatter {
+            ui.add_space(4.0);
+            grid_editor(app, ui);
+        }
         ui.add_space(4.0);
         // No-cut zone painting.
         ui.horizontal(|ui| {
@@ -270,8 +298,13 @@ fn split(app: &mut S3dApp, ui: &mut Ui) {
             let mut on = app.view.paint;
             if toggle(ui, &mut on).changed() {
                 app.view.paint = on;
+                if on {
+                    app.view.tab = view::Tab::Model;
+                    app.view.cut_draw = None;
+                    app.view.measure = false;
+                }
             }
-            ui.label(if app.view.paint { "Painting — drag on the model" } else { "Paint areas cuts must avoid" });
+            ui.label(if app.view.paint { "Painting — drag on the model" } else if app.doc.settings.split.mode == SplitMode::Grid { "Paint areas to check (grid cuts are not moved)" } else { "Paint areas cuts must avoid" });
         });
         if app.view.paint {
             ui.horizontal(|ui| {
@@ -282,70 +315,133 @@ fn split(app: &mut S3dApp, ui: &mut Ui) {
         }
         if !app.doc.zones.is_empty() {
             ui.horizontal(|ui| {
-                ui.label(widgets::weak(ui, format!("{} painted spots", app.doc.zones.dabs.len())));
+                let what = if app.doc.settings.split.mode == SplitMode::Grid { "pieces cut through them are flagged" } else { "cuts keep out of them" };
+                ui.label(widgets::weak(ui, format!("{} painted spots · {what}", app.doc.zones.dabs.len())));
                 if ui.small_button("Clear").clicked() {
                     app.doc.zones.dabs.clear();
                 }
             });
         }
-        ui.add_space(6.0);
-        let label = if app.doc.split.is_some() { "Split again" } else { "Split" };
-        if primary_button(ui, label, !busy && app.doc.source.is_some()).on_hover_text("Cuts the model, then adds connectors and part numbers").clicked() {
-            app.start_split();
-        }
-        ui.label(RichText::new("Split also adds connectors and part numbers, so pieces come out finished.").color(p.text_weak).size(12.0));
+        let note = if app.doc.settings.split.mode == SplitMode::Grid {
+            "Grid cuts exactly where the planes are, then checks the pieces; it does not move cuts. It also adds the features from the Features step. Splitting again starts over and discards manual edits."
+        } else {
+            "Split also adds the features from the Features step, so pieces come out finished. Splitting again starts over and discards manual edits."
+        };
+        ui.label(RichText::new(note).color(p.text_weak).size(12.0));
     });
     edits_card(app, ui);
 }
 
+/// Grid mode: how many cuts along each axis and where, before cutting.
+fn grid_editor(app: &mut S3dApp, ui: &mut Ui) {
+    let p = app.palette();
+    let Some((mesh, _)) = app.doc.prepared_mesh() else { return };
+    let bb = mesh.bbox();
+    let grid = s3d_core::split::grid::cuts(&bb, &app.doc.settings);
+    let mut cuts = grid.clone();
+    let cell = {
+        let bed = app.doc.settings.printer.usable();
+        let t = app.doc.settings.split.target_size;
+        [0, 1, 2].map(|a| t.map_or(bed[a], |t| t.min(bed[a])))
+    };
+    let mut hover = None;
+    ui.horizontal(|ui| {
+        widgets::field_label(ui, "Grid cuts", "split.grid");
+        widgets::right(ui, |ui| {
+            if ui.small_button("Reset").on_hover_text("Evenly spaced, as few cuts as the piece size allows").clicked() {
+                app.doc.settings.split.grid = None;
+            }
+            if ui.small_button("Space evenly").on_hover_text("Keep the number of cuts, spread them evenly").clicked() {
+                for a in 0..3 {
+                    cuts[a] = s3d_core::split::grid::even(bb.min[a], bb.max[a], cuts[a].len());
+                }
+            }
+        });
+    });
+    for (a, name) in ["X", "Y", "Z"].iter().enumerate() {
+        let (lo, hi) = (bb.min[a], bb.max[a]);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(*name).font(theme::semibold(13.0)).color(p.text_strong));
+            let mut n = cuts[a].len() as u32;
+            if ui.small_button("−").on_hover_text("One cut fewer").clicked() && n > 0 {
+                n -= 1;
+            }
+            ui.label(RichText::new(format!("{n}")).monospace());
+            if ui.small_button("+").on_hover_text("One cut more").clicked() && n < 40 {
+                n += 1;
+            }
+            if n as usize != cuts[a].len() {
+                cuts[a] = s3d_core::split::grid::even(lo, hi, n as usize);
+            }
+            ui.label(widgets::weak(ui, if n == 1 { "cut" } else { "cuts" }));
+            // Longest cell along this axis.
+            let mut edges: Vec<f32> = cuts[a].iter().copied().filter(|x| *x > lo && *x < hi).collect();
+            edges.extend([lo, hi]);
+            edges.sort_by(f32::total_cmp);
+            let longest = edges.windows(2).map(|w| w[1] - w[0]).fold(0.0f32, f32::max);
+            let txt = RichText::new(format!("cells up to {longest:.0} mm")).size(12.0);
+            ui.label(if longest > cell[a] + 0.5 { txt.color(p.warn) } else { txt.color(p.text_weak) }).on_hover_text(format!("The model spans {lo:.0} to {hi:.0} mm along {name}; pieces may be up to {:.0} mm.", cell[a]));
+        });
+        if !cuts[a].is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(18.0);
+                for (i, v) in cuts[a].iter_mut().enumerate() {
+                    let r = ui.add(egui::DragValue::new(v).range(lo..=hi).speed(1.0).max_decimals(1).suffix(" mm"));
+                    if r.hovered() || r.dragged() || r.has_focus() {
+                        hover = Some((a, i));
+                    }
+                }
+            });
+        }
+    }
+    app.view.grid_hover = hover;
+    if cuts != grid {
+        app.doc.settings.split.grid = Some(cuts);
+    }
+}
+
+/// Manual edits made since the split, newest first. Clicking one selects the
+/// pieces it produced.
 fn edits_card(app: &mut S3dApp, ui: &mut Ui) {
     if app.doc.edits.is_empty() {
         return;
     }
     let p = app.palette();
-    let mut remove = None;
+    let part = app.doc.split.clone();
+    let mut pick: Option<Vec<s3d_core::partition::PieceId>> = None;
     card(ui, |ui| {
-        section_title(ui, &format!("Manual edits ({})", app.doc.edits.len()));
-        ui.label(widgets::weak(ui, "Replayed after every split."));
-        for (i, e) in app.doc.edits.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let st = app.doc.edit_status.get(i);
-                let (c, t) = match st {
-                    Some(EditStatus::Applied) | None => (p.good, "✓"),
-                    Some(EditStatus::Orphaned) => (p.warn, "?"),
-                    Some(EditStatus::Failed(_)) => (p.bad, "✖"),
-                };
-                let r = ui.label(RichText::new(t).color(c));
-                if let Some(EditStatus::Failed(m)) = st {
-                    r.on_hover_text(m.clone());
-                } else if let Some(EditStatus::Orphaned) = st {
-                    r.on_hover_text("Its piece or cut no longer exists after re-splitting.");
+        ui.horizontal(|ui| {
+            section_title(ui, "Manual edits");
+            ui.label(RichText::new(format!("{}", app.doc.edits.len())).color(p.text_weak));
+        });
+        ui.label(widgets::weak(ui, "Click an edit to select its pieces. Undo (Ctrl+Z) takes back the last one; splitting again discards them all."));
+        egui::ScrollArea::vertical().id_salt("edits").max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
+            for (i, e) in app.doc.edits.iter().enumerate().rev() {
+                let live: Vec<_> = e.pieces.iter().copied().filter(|id| part.as_ref().is_some_and(|s| s.partition.piece(*id).is_some())).collect();
+                let text = RichText::new(format!("{}.  {}", i + 1, e.text)).color(if live.is_empty() { p.text_weak } else { p.text });
+                let r = ui.add_enabled(!live.is_empty(), egui::Button::new(text).frame(false));
+                let r = if live.is_empty() { r.on_disabled_hover_text("Changed again by a later edit") } else { r.on_hover_text("Select these pieces") };
+                if r.clicked() {
+                    pick = Some(live);
                 }
-                ui.label(format!("{}. {}", i + 1, e.describe()));
-                widgets::right(ui, |ui| {
-                    if ui.add_enabled(!app.jobs.busy(), egui::Button::new("✕").small()).on_hover_text("Remove this edit (takes effect on the next split)").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            });
-        }
+            }
+        });
     });
-    if let Some(i) = remove {
-        app.doc.edits.remove(i);
-        if i < app.doc.edit_status.len() {
-            app.doc.edit_status.remove(i);
-        }
+    if let Some(ids) = pick {
+        app.view.select(ids.first().copied());
+        app.view.multi = ids.into_iter().skip(1).collect();
+        app.view.tab = view::Tab::Model;
     }
 }
 
-fn connectors(app: &mut S3dApp, ui: &mut Ui) {
+fn features(app: &mut S3dApp, ui: &mut Ui) {
     let busy = app.jobs.busy();
     if app.doc.split.is_none() {
         card(ui, |ui| {
-            ui.label(widgets::weak(ui, "Split the model first. Connectors are added to the pieces after splitting."));
+            ui.label(widgets::weak(ui, "Split the model first. These features are added to the pieces when splitting, and can be changed here afterwards."));
         });
-    } else if app.status(Step::Connectors) == Status::Stale && stale_banner(app, ui, "Connector settings changed.") {
-        app.start_connectors();
+    } else if app.status(Step::Features) == Status::Stale && stale_banner(app, ui, "Feature settings changed.") {
+        app.start_features();
     }
     if let Some(a) = app.doc.split.as_ref().and_then(|s| s.pin_advice) {
         let p = app.palette();
@@ -360,7 +456,7 @@ fn connectors(app: &mut S3dApp, ui: &mut Ui) {
         if apply {
             app.doc.settings.connectors.diameter = a.diameter;
             app.doc.settings.connectors.length = a.length;
-            app.start_connectors();
+            app.start_features();
         }
     }
     card(ui, |ui| {
@@ -373,9 +469,9 @@ fn connectors(app: &mut S3dApp, ui: &mut Ui) {
         if c.dowels {
             setting_grid(ui, "dowels", 2, |ui| {
                 setting(ui, "Pin diameter", "conn.diameter", |ui| num(ui, &mut c.diameter, "mm", 1.0..=30.0, 1));
-                setting(ui, "Clearance", "conn.clearance", |ui| num(ui, &mut c.clearance, "mm", 0.0..=2.0, 2));
-                ui.end_row();
                 setting(ui, "Pin length", "conn.length", |ui| num(ui, &mut c.length, "mm", 4.0..=200.0, 0));
+                ui.end_row();
+                setting(ui, "Clearance", "conn.clearance", |ui| num(ui, &mut c.clearance, "mm", 0.0..=2.0, 2));
                 setting(ui, "Pins per cut", "conn.per_cut", |ui| num_u32(ui, &mut c.per_cut, 1..=12));
                 ui.end_row();
             });
@@ -386,15 +482,13 @@ fn connectors(app: &mut S3dApp, ui: &mut Ui) {
         let c = &mut app.doc.settings.connectors;
         setting(ui, "Style", "conn.labels", |ui| widgets::segmented(ui, &mut c.labels, &[(LabelMode::Off, "Off"), (LabelMode::Emboss, "Emboss"), (LabelMode::Deboss, "Deboss")]));
         if c.labels != LabelMode::Off {
+            setting(ui, "Face", "conn.label_face", |ui| widgets::segmented(ui, &mut c.label_face, &[(LabelFace::Convex, "Convex (outside)"), (LabelFace::Concave, "Concave (inside)")]));
             setting_grid(ui, "labels", 2, |ui| {
                 setting(ui, "Size", "conn.label_size", |ui| num(ui, &mut c.label_size, "mm", 3.0..=50.0, 1));
                 setting(ui, "Depth", "conn.label_depth", |ui| num(ui, &mut c.label_depth, "mm", 0.2..=5.0, 1));
                 ui.end_row();
             });
-        }
-        ui.add_space(6.0);
-        if primary_button(ui, "Update connectors", !busy && app.doc.split.is_some()).clicked() {
-            app.start_connectors();
+            ui.label(widgets::weak(ui, "Right-click a piece to move its number to the other side."));
         }
     });
 }
@@ -413,12 +507,7 @@ fn export(app: &mut S3dApp, ui: &mut Ui) {
         let e = &mut app.doc.settings.export;
         setting_grid(ui, "beds", 2, |ui| {
             setting(ui, "Spacing", "export.spacing", |ui| num(ui, &mut e.spacing, "mm", 0.5..=50.0, 1));
-            setting(ui, "Assembly order", "export.keep_order", |ui| {
-                ui.horizontal(|ui| {
-                    toggle(ui, &mut e.keep_assembly_order);
-                    ui.label(if e.keep_assembly_order { "Keep" } else { "Free" });
-                })
-            });
+            setting(ui, "Assembly order", "export.keep_order", |ui| widgets::segmented(ui, &mut e.keep_assembly_order, &[(true, "Ordered"), (false, "Random")]));
             ui.end_row();
         });
         let n = app.view.beds.beds.len();
@@ -462,80 +551,62 @@ fn export(app: &mut S3dApp, ui: &mut Ui) {
                 widgets::field_label(ui, label, id);
             });
         }
-        ui.add_space(6.0);
-        let ready = !busy && app.doc.split.is_some();
-        if primary_button(ui, "Export files", ready).on_hover_text("Writes one 3MF per bed, the print list, guide and viewer").clicked() {
-            let folder = app.doc.settings.export.folder.clone().map(std::path::PathBuf::from).or_else(|| rfd::FileDialog::new().set_title("Export folder").pick_folder());
-            if let Some(f) = folder {
-                app.doc.settings.export.folder = Some(f.display().to_string());
-                app.start_export(f);
+    });
+}
+
+/// The step's main button, kept in view between its settings and the
+/// parts list.
+fn action(app: &mut S3dApp, ui: &mut Ui) {
+    let busy = app.jobs.busy();
+    match app.step {
+        Step::Split => {
+            let label = if app.doc.split.is_some() { "Split again" } else { "Split" };
+            if primary_button(ui, label, !busy && app.doc.source.is_some()).on_hover_text("Cuts the model, then adds the features (pins, part numbers) set in Features").clicked() {
+                app.start_split();
             }
         }
-    });
-    if !app.recent.export_history.is_empty() {
-        card(ui, |ui| {
-            egui::CollapsingHeader::new(RichText::new("EXPORT HISTORY").font(theme::semibold(12.5)).color(p.text_weak)).default_open(false).show(ui, |ui| {
-                for h in &app.recent.export_history {
-                    ui.label(RichText::new(h).size(12.0).color(p.text_weak));
+        Step::Features => {
+            if primary_button(ui, "Apply features", !busy && app.doc.split.is_some()).clicked() {
+                app.start_features();
+            }
+        }
+        Step::Export => {
+            if primary_button(ui, "Export files", !busy && app.doc.split.is_some()).on_hover_text("Writes one 3MF per bed, the print list, guide and viewer").clicked() {
+                let folder = app.doc.settings.export.folder.clone().map(std::path::PathBuf::from).or_else(|| rfd::FileDialog::new().set_title("Export folder").pick_folder());
+                if let Some(f) = folder {
+                    app.doc.settings.export.folder = Some(f.display().to_string());
+                    app.start_export(f);
                 }
-            });
-        });
+            }
+        }
+        Step::Import | Step::Prepare => {}
     }
 }
 
-/// Printer drop-down in the top bar.
-pub fn printer_picker(app: &mut S3dApp, ui: &mut Ui) {
-    let cur = app.doc.settings.printer.printer.clone();
-    let mut list = s3d_core::printers::builtin();
-    list.extend(app.recent.custom_printers.iter().cloned());
-    let r = egui::ComboBox::from_id_salt("printer").selected_text(format!("🖨 {}", cur.name)).width(230.0).show_ui(ui, |ui| {
-        for pr in list {
-            let label = format!("{}   {:.0}×{:.0}×{:.0}", pr.name, pr.volume[0], pr.volume[1], pr.volume[2]);
-            if ui.selectable_label(pr == cur, label).clicked() {
-                app.doc.settings.printer.printer = pr;
-            }
-        }
-        ui.separator();
-        if ui.selectable_label(false, "Custom printer…").clicked() {
-            app.show_settings = true;
-        }
-    });
-    r.response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Printer"));
-    r.response.on_hover_ui(|ui| crate::tooltips::show(ui, "printer.model"));
+/// Printer size in the top bar; opens the Settings window to change it.
+pub fn printer_button(app: &mut S3dApp, ui: &mut Ui) {
+    let v = app.doc.settings.printer.volume;
+    let r = ui.button(format!("🖨 {:.0} × {:.0} × {:.0} mm", v[0], v[1], v[2]));
+    if r.clicked() {
+        app.show_settings = !app.show_settings;
+    }
+    r.on_hover_ui(|ui| crate::tooltips::show(ui, "printer.volume"));
 }
 
-/// The Settings window: printer size, margin, custom printers.
+/// The Settings window: printer build volume and bed margin.
 pub fn app_settings(app: &mut S3dApp, ui: &mut Ui) {
     let p = app.palette();
     ui.set_width(340.0);
     section_title(ui, "Printer");
     let pr = &mut app.doc.settings.printer;
-    ui.label(RichText::new(&pr.printer.name).color(p.text_strong));
     setting_grid(ui, "printer", 3, |ui| {
         for (i, ax) in ["X", "Y", "Z"].iter().enumerate() {
-            setting(ui, &format!("Build {ax}"), "printer.model", |ui| {
-                if num(ui, &mut pr.printer.volume[i], "mm", 50.0..=2000.0, 0).changed() && !pr.printer.name.starts_with("Custom") {
-                    pr.printer.name = "Custom".into();
-                }
-            });
+            setting(ui, &format!("Build {ax}"), "printer.volume", |ui| num(ui, &mut pr.volume[i], "mm", 50.0..=2000.0, 0));
         }
         ui.end_row();
         setting(ui, "Bed margin", "printer.margin", |ui| num(ui, &mut pr.margin, "mm", 0.0..=50.0, 1));
         ui.end_row();
     });
-    if pr.printer.name.starts_with("Custom") {
-        ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut pr.printer.name);
-            if ui.button("Save printer").clicked() {
-                let c = pr.printer.clone();
-                app.recent.custom_printers.retain(|x| x.name != c.name);
-                app.recent.custom_printers.push(c);
-                app.recent.save();
-            }
-        });
-    } else if ui.button("Make custom copy").clicked() {
-        pr.printer.name = format!("Custom ({})", pr.printer.name);
-    }
     let u = pr.usable();
     ui.label(RichText::new(format!("Usable volume: {:.0} × {:.0} × {:.0} mm", u[0], u[1], u[2])).color(p.text_weak));
 }

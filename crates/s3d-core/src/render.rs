@@ -13,6 +13,33 @@ pub struct Image {
     pub rgb: Vec<u8>,
 }
 
+impl Image {
+    /// Encodes as an 8-bit RGB PNG.
+    pub fn to_png(&self) -> Vec<u8> {
+        let mut raw = Vec::with_capacity((self.w * 3 + 1) * self.h);
+        for row in self.rgb.chunks(self.w * 3) {
+            raw.push(0);
+            raw.extend_from_slice(row);
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crate::io::zip::crc32(&body).to_be_bytes());
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&(self.w as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(self.h as u32).to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(b"IHDR", &ihdr);
+        chunk(b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6));
+        chunk(b"IEND", &[]);
+        out
+    }
+}
+
 pub struct DrawMesh<'a> {
     pub mesh: &'a Mesh,
     pub model: Mat4,

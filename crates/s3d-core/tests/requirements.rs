@@ -3,19 +3,18 @@
 use std::sync::Arc;
 
 use glam::{DVec3, Vec3};
-use s3d_core::edits::{EditOp, EditStatus, PieceRef, SeamRef};
+use s3d_core::edits::EditOp;
 use s3d_core::job::JobCtx;
 use s3d_core::manifold::Solid;
 use s3d_core::mesh::Mesh;
 use s3d_core::partition::Flag;
-use s3d_core::printers::Printer;
 use s3d_core::settings::{Settings, SplitMode};
 use s3d_core::split::{self, SplitInput};
 use s3d_core::zones::{Dab, Zones};
 
 fn settings(mode: SplitMode) -> Settings {
     let mut s = Settings::default();
-    s.printer.printer = Printer::new("test", 200.0, 200.0, 200.0);
+    s.printer.volume = [200.0, 200.0, 200.0];
     s.split.mode = mode;
     s.split.time_limit = 3.0;
     s
@@ -26,12 +25,12 @@ fn block(x: f64, y: f64, z: f64) -> Mesh {
     s.to_mesh()
 }
 
-fn run(mesh: &Mesh, s: &Settings, zones: Zones, edits: Vec<EditOp>, keep: Vec<Arc<Solid>>) -> split::SplitOutput {
-    run_keep(mesh, s, zones, edits, keep, vec![])
+fn run(mesh: &Mesh, s: &Settings, zones: Zones, keep: Vec<Arc<Solid>>) -> split::SplitOutput {
+    run_keep(mesh, s, zones, keep, vec![])
 }
 
-fn run_keep(mesh: &Mesh, s: &Settings, zones: Zones, edits: Vec<EditOp>, keep: Vec<Arc<Solid>>, keep_planes: Vec<s3d_core::plane::Plane>) -> split::SplitOutput {
-    split::run(SplitInput { mesh: Arc::new(mesh.clone()), settings: s.clone(), zones, edits, keep, keep_planes, preview: None }, &JobCtx::new()).unwrap()
+fn run_keep(mesh: &Mesh, s: &Settings, zones: Zones, keep: Vec<Arc<Solid>>, keep_planes: Vec<s3d_core::plane::Plane>) -> split::SplitOutput {
+    split::run(SplitInput { mesh: Arc::new(mesh.clone()), settings: s.clone(), zones, keep, keep_planes, preview: None }, &JobCtx::new()).unwrap()
 }
 
 fn assert_valid(p: &s3d_core::partition::Partition, source_volume: f64) {
@@ -48,70 +47,125 @@ fn assert_valid(p: &s3d_core::partition::Partition, source_volume: f64) {
 fn grid_pieces_fit_and_are_solid() {
     let m = block(500.0, 300.0, 250.0);
     let s = settings(SplitMode::Grid);
-    let out = run(&m, &s, Zones::default(), vec![], vec![]);
+    let out = run(&m, &s, Zones::default(), vec![]);
     assert!(out.partition.pieces.len() >= 6);
     assert_valid(&out.partition, m.volume());
 }
 
-#[test]
-fn triangle_pieces_fit_print_and_stagger() {
-    let m = block(600.0, 120.0, 450.0);
-    let s = settings(SplitMode::Triangle);
-    let out = run(&m, &s, Zones::default(), vec![], vec![]);
-    let p = &out.partition;
-    assert_valid(p, m.volume());
-    // A solid block: every piece prints without support.
-    let support = p.pieces.iter().filter(|q| q.flags.iter().any(|f| matches!(f, Flag::NeedsSupport(_)))).count();
-    assert_eq!(support, 0, "{} pieces need support", support);
-    // Most pieces are bounded by three or four cuts (triangles).
-    let few_cuts = p.pieces.iter().filter(|q| s3d_core::partition::dedup_planes(p.seams_of(q.id).map(|s| s.plane)).len() <= 4).count();
-    assert!(few_cuts * 2 >= p.pieces.len(), "{few_cuts} of {}", p.pieces.len());
+/// Every Shatter-mode requirement on one result: pieces fit, print without
+/// support, are not tall, have no sharp corners, feather edges or thin
+/// strips, and no seam runs straight on into another.
+fn assert_shatter_clean(p: &s3d_core::partition::Partition, s: &Settings) {
+    let mut bad: Vec<String> = Vec::new();
+    for q in &p.pieces {
+        let f: Vec<&Flag> = q.flags.iter().filter(|f| !matches!(f, Flag::SkippedDowel)).collect();
+        if !f.is_empty() {
+            bad.push(format!("#{} {:?}", q.label, f));
+        }
+    }
+    assert!(bad.is_empty(), "{} of {} pieces flagged: {bad:?}", bad.len(), p.pieces.len());
+    let qp = s3d_core::split::quality::QualityParams::from_settings(s);
+    let mut cache = s3d_core::split::quality::SeamCache::default();
+    cache.update(p);
+    let chains = s3d_core::split::quality::chains(p, &cache);
+    let bad: Vec<_> = chains.iter().filter(|c| c.is_violation(&qp)).collect();
+    assert!(bad.is_empty(), "aligned seams: {bad:?}");
 }
 
 #[test]
-fn no_cut_zone_moves_grid_cut() {
+fn shatter_block_prints_well_without_aligned_seams() {
+    let m = block(600.0, 120.0, 450.0);
+    let mut s = settings(SplitMode::Shatter);
+    s.split.time_limit = 60.0;
+    let out = run(&m, &s, Zones::default(), vec![]);
+    let p = &out.partition;
+    assert_valid(p, m.volume());
+    assert_shatter_clean(p, &s);
+    // Seams meet at Y-shaped corners: most pieces have several neighbours.
+    assert!(p.pieces.len() >= 8, "{}", p.pieces.len());
+}
+
+#[test]
+fn shatter_shell_prints_well_without_aligned_seams() {
+    // A hollow rounded box, like a body shell: pieces stand on a cut.
+    let outer = Solid::sphere(260.0, 96).unwrap().transform(&glam::DMat4::from_scale(DVec3::new(1.0, 0.7, 0.55))).unwrap();
+    let inner = Solid::sphere(254.0, 96).unwrap().transform(&glam::DMat4::from_scale(DVec3::new(1.0, 0.7, 0.55) * (254.0 - 6.0) / 254.0)).unwrap();
+    let shell = outer.subtract(&inner).unwrap().translate(DVec3::new(0.0, 0.0, 150.0)).unwrap();
+    let m = shell.to_mesh();
+    let mut s = settings(SplitMode::Shatter);
+    s.printer.volume = [220.0, 220.0, 220.0];
+    s.split.time_limit = 90.0;
+    let out = run(&m, &s, Zones::default(), vec![]);
+    let p = &out.partition;
+    assert_valid(p, m.volume());
+    assert_shatter_clean(p, &s);
+    eprintln!("shell: {} pieces, {:?}", p.pieces.len(), out.stats);
+}
+
+#[test]
+fn grid_cuts_where_placed_and_only_checks() {
     let m = block(300.0, 100.0, 100.0);
-    let s = settings(SplitMode::Grid);
-    let plain = run(&m, &s, Zones::default(), vec![], vec![]);
+    let mut s = settings(SplitMode::Grid);
     let x_cuts = |o: &split::SplitOutput| -> Vec<f64> {
         let mut v: Vec<f64> = o.partition.seams.iter().filter(|s| s.plane.normal.x.abs() > 0.99).map(|s| s.plane.offset.abs()).collect();
+        v.sort_by(f64::total_cmp);
         v.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
         v
     };
-    let base = x_cuts(&plain);
-    assert_eq!(base.len(), 1);
-    // Paint right where the cut was.
-    let zones = Zones { dabs: vec![Dab { p: Vec3::new(base[0] as f32, 50.0, 100.0), radius: 8.0 }] };
-    let moved = x_cuts(&run(&m, &s, zones, vec![], vec![]));
-    assert!((moved[0] - base[0]).abs() >= 8.0, "cut at {} still crosses the zone at {}", moved[0], base[0]);
+    // Evenly spaced by default: 300 mm in two cells of 150.
+    let plain = run(&m, &s, Zones::default(), vec![]);
+    assert_eq!(x_cuts(&plain), vec![150.0]);
+    // Painted right on the cut: the cut stays, the pieces are flagged.
+    let zones = Zones { dabs: vec![Dab { p: Vec3::new(150.0, 50.0, 100.0), radius: 8.0, n: Vec3::Z }] };
+    let painted = run(&m, &s, zones, vec![]);
+    assert_eq!(x_cuts(&painted), vec![150.0]);
+    assert!(painted.partition.pieces.iter().all(|q| q.flags.contains(&Flag::InZone)));
+    // Cuts placed by hand, any number per axis.
+    s.split.grid = Some([vec![60.0, 200.0], vec![50.0], vec![]]);
+    let placed = run(&m, &s, Zones::default(), vec![]);
+    assert_eq!(x_cuts(&placed), vec![60.0, 200.0]);
+    assert_eq!(placed.partition.pieces.len(), 6);
+    assert_valid(&placed.partition, m.volume());
 }
 
 #[test]
-fn edits_replay_after_resplit() {
-    let m = block(360.0, 100.0, 100.0);
-    let s = settings(SplitMode::Grid);
-    let first = run(&m, &s, Zones::default(), vec![], vec![]);
-    let seam = first.partition.seams[0].clone();
-    let moved = seam.plane.moved(20.0);
-    let edit = EditOp::MoveSeam { seam: SeamRef::of(&first.partition, seam.id).unwrap(), plane: moved };
-    // Changing an unrelated setting re-splits; the edit is replayed.
-    let mut s2 = s.clone();
-    s2.split.min_piece = 10.0;
-    let again = run(&m, &s2, Zones::default(), vec![edit], vec![]);
-    assert_eq!(again.edit_status, vec![EditStatus::Applied]);
-    assert!(again.partition.seams.iter().any(|x| x.plane.coincident(&moved, 1e-6, 1e-3)));
+fn shatter_cuts_avoid_painted_zone() {
+    let m = block(380.0, 160.0, 120.0);
+    let s = settings(SplitMode::Shatter);
+    let plain = run(&m, &s, Zones::default(), vec![]);
+    // Paint a strip on the top face across the middle of the first seam that
+    // reaches it, then split again: no cut face may touch the paint.
+    let top = plain.partition.seams.iter().find(|x| x.center.z > 20.0 && x.plane.normal.z.abs() < 0.5).expect("a seam reaching the top");
+    let mut dabs = Vec::new();
+    for k in -3..=3 {
+        let along = top.plane.normal.cross(DVec3::Z).normalize().as_vec3();
+        let mut c = top.plane.project(top.center.as_dvec3()).as_vec3() + along * (k as f32 * 8.0);
+        c.z = 120.0;
+        dabs.push(Dab { p: c, radius: 9.0, n: Vec3::Z });
+    }
+    let zones = Zones { dabs };
+    let before: u32 = plain.partition.pieces.iter().map(|q| split::quality::zone_hits(&q.mesh, &split::quality::piece_cuts(&plain.partition, q.id), &zones)).sum();
+    assert!(before > 0, "the paint should cross a cut of the plain split");
+    let out = run(&m, &s, zones.clone(), vec![]);
+    assert_valid(&out.partition, m.volume());
+    for q in &out.partition.pieces {
+        let cuts = split::quality::piece_cuts(&out.partition, q.id);
+        let hits = split::quality::zone_hits(&q.mesh, &cuts, &zones);
+        assert_eq!(hits, 0, "piece {} still cut through {hits} painted spot(s)", q.label);
+        assert!(!q.flags.contains(&Flag::InZone));
+    }
 }
 
 #[test]
 fn locked_piece_survives_resplit() {
     let m = block(360.0, 100.0, 100.0);
     let s = settings(SplitMode::Grid);
-    let first = run(&m, &s, Zones::default(), vec![], vec![]);
+    let first = run(&m, &s, Zones::default(), vec![]);
     let locked = &first.partition.pieces[0];
     let planes: Vec<s3d_core::plane::Plane> = first.partition.seams_of(locked.id).map(|s| s.plane).collect();
     let mut s2 = s.clone();
-    s2.printer.printer = Printer::new("smaller", 150.0, 150.0, 150.0);
-    let again = run_keep(&m, &s2, Zones::default(), vec![], vec![locked.solid.clone()], planes);
+    s2.split.target_size = Some(90.0);
+    let again = run_keep(&m, &s2, Zones::default(), vec![locked.solid.clone()], planes);
     let kept = again.partition.pieces.iter().find(|q| q.locked).expect("locked piece kept");
     assert!(again.partition.seams_of(kept.id).count() > 0, "locked piece keeps its seams");
     assert!((kept.volume - locked.volume).abs() < 1e-3);
@@ -124,7 +178,7 @@ fn islands_become_separate_pieces() {
     let a = Solid::cube(DVec3::splat(50.0), false).unwrap();
     let b = Solid::cube(DVec3::splat(50.0), false).unwrap().translate(DVec3::new(100.0, 0.0, 0.0)).unwrap();
     let m = a.union(&b).unwrap().to_mesh();
-    let out = run(&m, &settings(SplitMode::Grid), Zones::default(), vec![], vec![]);
+    let out = run(&m, &settings(SplitMode::Grid), Zones::default(), vec![]);
     assert_eq!(out.partition.pieces.len(), 2);
 }
 
@@ -133,7 +187,7 @@ fn hollowed_model_splits_into_valid_pieces() {
     let m = block(300.0, 150.0, 150.0);
     let h = s3d_core::hollow::hollow(&m, 4.0, &JobCtx::new()).unwrap();
     assert!(h.volume() < m.volume() * 0.5);
-    let out = run(&h, &settings(SplitMode::Grid), Zones::default(), vec![], vec![]);
+    let out = run(&h, &settings(SplitMode::Grid), Zones::default(), vec![]);
     assert_valid(&out.partition, h.volume());
 }
 
@@ -141,18 +195,16 @@ fn hollowed_model_splits_into_valid_pieces() {
 fn merge_and_cut_edits() {
     let m = block(360.0, 100.0, 100.0);
     let s = settings(SplitMode::Grid);
-    let mut p = run(&m, &s, Zones::default(), vec![], vec![]).partition;
+    let mut p = run(&m, &s, Zones::default(), vec![]).partition;
     let n = p.pieces.len();
     let (a, b) = (p.seams[0].a, p.seams[0].b);
-    let op = EditOp::Merge { pieces: vec![PieceRef::of(&p, a).unwrap(), PieceRef::of(&p, b).unwrap()] };
-    let (st, _) = s3d_core::edits::apply(&mut p, &op);
-    assert_eq!(st, EditStatus::Applied);
+    s3d_core::edits::apply(&mut p, EditOp::Merge(vec![a, b])).unwrap();
     assert_eq!(p.pieces.len(), n - 1);
     let target = p.pieces[0].id;
     let c = p.piece(target).unwrap().centroid.as_dvec3();
-    let op = EditOp::Cut { piece: PieceRef::of(&p, target).unwrap(), plane: s3d_core::plane::Plane::through(c, DVec3::Y) };
-    let (st, _) = s3d_core::edits::apply(&mut p, &op);
-    assert_eq!(st, EditStatus::Applied);
+    let (new, entry) = s3d_core::edits::apply(&mut p, EditOp::Cut(target, s3d_core::plane::Plane::through(c, DVec3::Y))).unwrap();
+    assert_eq!(new.len(), 2);
+    assert!(entry.text.starts_with("Cut #"), "{}", entry.text);
     assert_eq!(p.pieces.len(), n);
 }
 
@@ -240,7 +292,7 @@ fn holes_only_open_on_their_own_cut_face() {
 fn nudged_grid_cells_still_fit() {
     let m = block(524.4, 100.0, 100.0);
     let s = settings(SplitMode::Grid);
-    let plain = run(&m, &s, Zones::default(), vec![], vec![]);
+    let plain = run(&m, &s, Zones::default(), vec![]);
     // Paint just inside each cut so the cuts are pushed apart.
     let dabs: Vec<Dab> = plain
         .partition
@@ -248,8 +300,46 @@ fn nudged_grid_cells_still_fit() {
         .iter()
         .filter(|x| x.plane.normal.x.abs() > 0.99)
         .map(|x| x.plane.offset.abs() as f32)
-        .map(|x| Dab { p: Vec3::new(x + if x > 262.0 { -3.0 } else { 3.0 }, 50.0, 100.0), radius: 6.0 })
+        .map(|x| Dab { p: Vec3::new(x + if x > 262.0 { -3.0 } else { 3.0 }, 50.0, 100.0), radius: 6.0, n: Vec3::ZERO })
         .collect();
-    let out = run(&m, &s, Zones { dabs }, vec![], vec![]);
+    let out = run(&m, &s, Zones { dabs }, vec![]);
     assert!(out.partition.pieces.iter().all(|q| !q.flags.contains(&Flag::TooBig)));
+}
+
+#[test]
+fn drawn_cut_line_becomes_a_square_cut() {
+    let m = block(220.0, 100.0, 60.0);
+    let p = s3d_core::partition::Partition::from_solids(vec![Solid::from_mesh(&m).unwrap()]);
+    // A slightly wobbly stroke across the top face near x = 90.
+    let pts: Vec<Vec3> = (0..20).map(|i| Vec3::new(90.0 + if i % 2 == 0 { 1.5 } else { -1.5 }, 5.0 + i as f32 * 4.7, 60.0)).collect();
+    let normals = vec![Vec3::Z; pts.len()];
+    let q = split::quality::QualityParams::from_settings(&settings(SplitMode::Grid));
+    let pl = split::refine::cut_along(&p, p.pieces[0].id, &pts, &normals, &q, &JobCtx::new()).expect("a cut");
+    assert!(pl.normal.x.abs() > 0.97, "cut normal {:?}", pl.normal);
+    let x = pl.offset * pl.normal.x.signum();
+    assert!((x - 90.0).abs() <= 7.0, "cut at x = {x}");
+}
+
+#[test]
+fn find_better_cut_moves_a_shared_cut_first() {
+    // A 7 mm slice between two grid cuts is too thin.
+    let m = block(300.0, 100.0, 100.0);
+    let mut s = settings(SplitMode::Grid);
+    s.split.grid = Some([vec![150.0, 157.0], vec![], vec![]]);
+    let p = run(&m, &s, Zones::default(), vec![]).partition;
+    let sliver = p.pieces.iter().find(|q| q.bbox.size().x < 10.0).expect("the slice");
+    assert!(sliver.flags.contains(&Flag::Thin), "{:?}", sliver.flags);
+    let q = split::quality::QualityParams::from_settings(&s);
+    let imp = split::refine::improve_piece(&p, sliver.id, &q, &JobCtx::new()).expect("a better cut");
+    // First choice: merged with a neighbour and cut again a little further on.
+    assert_eq!(imp.old.len(), 2);
+    assert_eq!(imp.planes.len(), 1);
+    assert!(imp.planes[0].normal.x.abs() > 0.999, "{:?}", imp.planes[0]);
+    let mut p2 = p.clone();
+    let (changed, entry) = s3d_core::edits::apply(&mut p2, EditOp::Replace { old: imp.old, new: imp.new, planes: imp.planes }).unwrap();
+    assert!(entry.text.starts_with("Re-cut"), "{}", entry.text);
+    split::check_pieces(&mut p2, &changed, &s, &Zones::default());
+    assert_eq!(p2.pieces.len(), 3);
+    assert!(p2.pieces.iter().all(|q| !q.flags.contains(&Flag::Thin)), "{:?}", p2.pieces.iter().map(|q| (q.bbox.size().x, q.flags.clone())).collect::<Vec<_>>());
+    assert_valid(&p2, m.volume());
 }

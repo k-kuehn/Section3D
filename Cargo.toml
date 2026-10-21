@@ -12,7 +12,6 @@ s3d-core = { path = "crates/s3d-core" }
 glam = { version = "0.34", features = ["serde", "bytemuck"] }
 rayon = "1.12"
 miniz_oxide = "0.9"
-quick-xml = "0.42"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytemuck = { version = "1.25", features = ["derive"] }

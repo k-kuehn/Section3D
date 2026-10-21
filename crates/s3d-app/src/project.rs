@@ -16,8 +16,7 @@ impl Saved {
     pub fn from_doc(doc: &Document, view: &ViewState) -> Saved {
         Saved(ProjectData {
             settings: doc.settings.clone(),
-            edits: doc.edits.clone(),
-            edit_status: doc.edit_status.clone(),
+            edit_log: doc.edits.clone(),
             zones: doc.zones.clone(),
             source: doc.source.as_ref().map(|s| SourceData { name: s.name.clone(), path: s.path.as_ref().map(|p| p.display().to_string()), health: s.health.clone(), mesh: s.mesh.clone() }),
             hollow: doc.hollow.as_ref().map(|h| (h.key, h.mesh.clone())),
@@ -37,8 +36,7 @@ impl Loaded {
         let mut doc = Document::default();
         let d = self.data;
         doc.settings = d.settings;
-        doc.edits = d.edits;
-        doc.edit_status = d.edit_status;
+        doc.edits = d.edit_log;
         doc.zones = d.zones;
         if let Some(s) = d.source {
             let id = doc.new_id();

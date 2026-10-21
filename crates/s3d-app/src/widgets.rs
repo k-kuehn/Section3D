@@ -1,9 +1,10 @@
 //! Reusable widgets: cards, labelled numeric fields with
 //! units and `?` help, primary buttons, badges and toggles.
 
+use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Layout, Response, RichText, Sense, Stroke, Ui, Vec2};
 
-use crate::theme::{self, Palette};
+use crate::theme;
 use crate::tooltips;
 
 pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
@@ -94,11 +95,22 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool) -> Response {
 }
 
 pub fn badge(ui: &mut Ui, text: &str, color: Color32) -> Response {
+    badge_with(ui, text, color, Sense::hover(), false)
+}
+
+/// A badge that can be clicked; `on` shows it pressed.
+pub fn badge_button(ui: &mut Ui, text: &str, color: Color32, on: bool) -> Response {
+    badge_with(ui, text, color, Sense::click(), on).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn badge_with(ui: &mut Ui, text: &str, color: Color32, sense: Sense, on: bool) -> Response {
     let font = theme::semibold(10.5);
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
     let size = galley.size() + Vec2::new(14.0, 6.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect(rect, CornerRadius::same(255), color.gamma_multiply(0.14), Stroke::new(1.0, color.gamma_multiply(0.7)), egui::StrokeKind::Inside);
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(if sense.senses_click() { egui::Role::Button } else { egui::Role::Label }, true, text));
+    let fill = if on { 0.4 } else if resp.hovered() { 0.25 } else { 0.14 };
+    ui.painter().rect(rect, CornerRadius::same(255), color.gamma_multiply(fill), Stroke::new(1.0, color.gamma_multiply(0.7)), egui::StrokeKind::Inside);
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
     resp
 }
@@ -127,7 +139,7 @@ pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
-/// Horizontal segmented control (e.g. Triangle | Grid).
+/// Horizontal segmented control (e.g. Shatter | Grid).
 pub fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &str)]) -> Response {
     let p = theme::ui_palette(ui);
     let mut changed = None;
@@ -176,10 +188,6 @@ pub fn right<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 
 pub fn weak(ui: &Ui, text: impl Into<String>) -> RichText {
     RichText::new(text.into()).color(theme::ui_palette(ui).text_weak)
-}
-
-pub fn palette_color_for_status(p: &Palette, ok: bool, warn: bool) -> Color32 {
-    if !ok { p.bad } else if warn { p.warn } else { p.good }
 }
 
 /// Framed on/off button (toolbar style).

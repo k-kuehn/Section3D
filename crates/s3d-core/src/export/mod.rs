@@ -122,7 +122,6 @@ pub fn run(folder: &Path, title: &str, part: &Partition, layout: &Layout, s: &Se
             }
         }
     }
-    job.set_progress(0.3);
     // Single-part STLs in print orientation.
     if s.export.single_stls {
         job.set_stage("Writing STL files");
@@ -148,29 +147,27 @@ pub fn run(folder: &Path, title: &str, part: &Partition, layout: &Layout, s: &Se
         csv.push_str(&format!("{},{:.1},{:.1},{:.1},{:.1},{},\"{}\"\n", q.label, sz.x, sz.y, sz.z, weight_g(q, s), bed_of(q.id), flags_text(q)));
     }
     write(&format!("{}_print_list.csv", file_name("{project}", title, None, None)), csv.as_bytes(), &mut files)?;
-    job.set_progress(0.4);
     let asm = assembly::plan(part);
     if s.export.guide {
         job.set_stage("Writing assembly guide");
         let pdf = guide(title, part, &asm, layout, s, job)?;
         write(&format!("{}_assembly_guide.pdf", file_name("{project}", title, None, None)), &pdf, &mut files)?;
     }
-    job.set_progress(0.85);
     if s.export.viewer {
         job.set_stage("Writing 3D viewer");
-        let budget = (400_000 / part.pieces.len().max(1)).max(400);
-        let simplified: Vec<(u32, Mesh, usize, Vec3)> = part
-            .pieces
-            .par_iter()
-            .map(|q| {
-                let step = asm.order.iter().position(|x| *x == q.id).unwrap_or(0);
-                (q.label, crate::simplify::cluster(q.display_mesh(), budget), step, asm.insert_dir.get(&q.id).copied().unwrap_or(-Vec3::Z))
-            })
+        // Full detail unless the model is huge; then every piece gets its share.
+        let total: usize = part.pieces.iter().map(|q| q.display_mesh().tris.len()).sum();
+        let keep = (3_000_000.0 / total.max(1) as f64).min(1.0);
+        let simplified: Vec<(u32, Mesh)> = part.pieces.par_iter().map(|q| (q.label, crate::simplify::cluster(q.display_mesh(), ((q.display_mesh().tris.len() as f64 * keep) as usize).max(2_000)))).collect();
+        let vparts: Vec<viewer::ViewerPart> = simplified.iter().map(|(l, m)| viewer::ViewerPart { label: *l, mesh: m, color: piece_color(*l) }).collect();
+        let label_of = |id: &u32| part.piece(*id).map(|q| q.label).unwrap_or(0);
+        let vsteps: Vec<viewer::ViewerStep> = asm
+            .steps
+            .iter()
+            .map(|st| viewer::ViewerStep { name: st.name.clone(), a_name: st.a_name.clone(), b_name: st.b_name.clone(), a: st.a.iter().map(label_of).collect(), b: st.b.iter().map(label_of).collect() })
             .collect();
-        let vparts: Vec<viewer::ViewerPart> = simplified.iter().map(|(l, m, st, d)| viewer::ViewerPart { label: *l, mesh: m, color: piece_color(*l), step: *st, insert: *d }).collect();
-        write(&format!("{}_viewer.html", file_name("{project}", title, None, None)), viewer::write(title, &vparts).as_bytes(), &mut files)?;
+        write(&format!("{}_viewer.html", file_name("{project}", title, None, None)), viewer::write(title, &vparts, &vsteps).as_bytes(), &mut files)?;
     }
-    job.set_progress(1.0);
     Ok(ExportResult { files, folder: folder.to_path_buf() })
 }
 
@@ -179,10 +176,10 @@ fn guide(title: &str, part: &Partition, asm: &assembly::Assembly, layout: &Layou
     use pdf::{A4, Page, Pdf};
     let mut doc = Pdf::default();
     let bb = part.pieces.iter().fold(Aabb::EMPTY, |b, q| b.union(&q.bbox));
-    let (iw, ih) = (900usize, 620usize);
+    let (iw, ih) = (1100usize, 760usize);
     let vp = render::iso_camera(&bb, iw as f32 / ih as f32);
     // Light meshes for drawing.
-    let budget = (300_000 / part.pieces.len().max(1)).max(300);
+    let budget = (1_000_000 / part.pieces.len().max(1)).max(1_200);
     let light: Vec<(u32, Mesh)> = part.pieces.par_iter().map(|q| (q.id, crate::simplify::cluster(q.display_mesh(), budget))).collect();
     let mesh_of = |id: u32| light.iter().find(|(i, _)| *i == id).map(|(_, m)| m);
     let label_of = |id: u32| part.piece(id).map(|q| q.label).unwrap_or(0);
@@ -200,9 +197,9 @@ fn guide(title: &str, part: &Partition, asm: &assembly::Assembly, layout: &Layou
     p.image(cover_img, 50.0, 330.0, 495.0, 495.0 * ih as f32 / iw as f32);
     let lines = [
         format!("{} parts on {} bed(s), about {:.0} g of filament", part.pieces.len(), layout.beds.len(), total_g),
-        format!("Printer: {}", s.printer.printer.name),
+        format!("Printer: {:.0} × {:.0} × {:.0} mm", s.printer.volume[0], s.printer.volume[1], s.printer.volume[2]),
         if s.connectors.dowels { format!("Dowel pins: {:.1} mm diameter, {:.0} mm long", s.connectors.diameter, s.connectors.length) } else { "No dowel pins".into() },
-        format!("{} assembly steps follow, one per page.", asm.order.len()),
+        format!("{} assembly steps follow, one per page: small sections first, then sections to sections.", asm.steps.len()),
     ];
     for (i, l) in lines.iter().enumerate() {
         p.text(50.0, 290.0 - i as f32 * 18.0, 12.0, false, l);
@@ -237,49 +234,57 @@ fn guide(title: &str, part: &Partition, asm: &assembly::Assembly, layout: &Layou
         doc.pages.push(p);
     }
 
-    // Steps (rendered in parallel).
+    // Steps (rendered in parallel): the two parts being joined, the second
+    // pulled back across the joint, framed on their own.
     job.set_stage("Rendering assembly steps");
-    let imgs: Vec<render::Image> = (0..asm.order.len())
-        .into_par_iter()
-        .map(|k| {
-            let cur = asm.order[k];
-            let dir = asm.insert_dir.get(&cur).copied().unwrap_or(-Vec3::Z);
-            let lift = part.piece(cur).map(|q| q.bbox.size().max_element() * 0.35).unwrap_or(0.0);
-            let items: Vec<DrawMesh> = asm.order[..=k]
-                .iter()
-                .filter_map(|id| {
-                    let m = mesh_of(*id)?;
-                    let is_cur = *id == cur;
-                    Some(DrawMesh {
-                        mesh: m,
-                        model: if is_cur { Mat4::from_translation(-dir * lift) } else { Mat4::IDENTITY },
-                        color: if is_cur { [1.0, 0.45, 0.2] } else { [0.78, 0.8, 0.84] },
-                        id: *id,
-                    })
-                })
-                .collect();
+    let imgs: Vec<render::Image> = asm
+        .steps
+        .par_iter()
+        .map(|st| {
+            let bb = st.a.iter().chain(&st.b).filter_map(|id| part.piece(*id)).fold(Aabb::EMPTY, |b, q| b.union(&q.bbox));
+            let lift = bb.size().max_element() * 0.12;
+            let mut items: Vec<DrawMesh> = Vec::new();
+            for (ids, is_b) in [(&st.a, false), (&st.b, true)] {
+                for id in ids.iter() {
+                    let Some(m) = mesh_of(*id) else { continue };
+                    let base = if is_b { [0.36, 0.62, 0.95] } else { [1.0, 0.55, 0.3] };
+                    let shade = 0.85 + 0.15 * ((label_of(*id) % 3) as f32 / 2.0);
+                    items.push(DrawMesh { mesh: m, model: if is_b { Mat4::from_translation(st.apart * lift) } else { Mat4::IDENTITY }, color: base.map(|c| c * shade), id: *id });
+                }
+            }
+            let vp = render::iso_camera(&bb, iw as f32 / ih as f32);
             render::render(&items, vp, iw, ih, [255, 255, 255])
         })
         .collect();
     job.check().map_err(|e| e.to_string())?;
-    for (k, img) in imgs.iter().enumerate() {
-        let cur = asm.order[k];
+    let n = asm.steps.len();
+    for (k, (st, img)) in asm.steps.iter().zip(&imgs).enumerate() {
         let idx = doc.add_image(img);
         let mut p = Page::default();
         p.color(0.1, 0.1, 0.12);
-        p.text(50.0, 790.0, 20.0, true, &format!("Step {} of {}", k + 1, asm.order.len()));
-        p.text(50.0, 765.0, 14.0, false, &format!("Add part #{}", label_of(cur)));
+        p.text(50.0, 790.0, 20.0, true, &format!("Step {} of {n}: make section {}", k + 1, st.name));
+        let part_text = |name: &str, ids: &[u32]| if ids.len() == 1 { format!("part {name}") } else { format!("section {name} ({} parts)", ids.len()) };
+        p.text(50.0, 765.0, 13.0, false, &format!("Join {} (orange) and {} (blue).", part_text(&st.a_name, &st.a), part_text(&st.b_name, &st.b)));
         p.image(idx, 50.0, 330.0, 495.0, 495.0 * ih as f32 / iw as f32);
         let mut y = 300.0;
-        let joins: Vec<u32> = part.neighbours(cur).into_iter().filter(|n| asm.order[..k].contains(n)).map(label_of).collect();
-        if !joins.is_empty() {
-            let pins = if s.connectors.dowels { " Glue the dowel pins into the holes first." } else { "" };
-            p.text(50.0, y, 12.0, false, &format!("Joins part(s) {}.{pins}", joins.iter().map(|l| format!("#{l}")).collect::<Vec<_>>().join(", ")));
+        let staples = (st.length / 40.0).ceil().max(1.0);
+        p.text(50.0, y, 12.0, false, &format!("Seam length about {:.0} mm: about {staples:.0} heat staples, one every 40 mm, set from the inside.", st.length));
+        y -= 18.0;
+        if s.connectors.dowels {
+            p.text(50.0, y, 12.0, false, "Glue the dowel pins into one side first, then press the parts together.");
             y -= 18.0;
         }
-        if asm.blocked.contains(&cur) {
-            p.color(0.8, 0.45, 0.0);
-            p.text(50.0, y, 12.0, true, "No straight path: this part cannot slide onto all pins at once. Fit it before its neighbours or glue without pins.");
+        let labels = |ids: &[u32]| {
+            let mut l: Vec<u32> = ids.iter().map(|id| label_of(*id)).collect();
+            l.sort_unstable();
+            l.iter().map(|x| format!("#{x}")).collect::<Vec<_>>().join(" ")
+        };
+        if st.a.len() > 1 {
+            p.text(50.0, y, 10.0, false, &format!("{}: {}", st.a_name, labels(&st.a)));
+            y -= 15.0;
+        }
+        if st.b.len() > 1 {
+            p.text(50.0, y, 10.0, false, &format!("{}: {}", st.b_name, labels(&st.b)));
         }
         doc.pages.push(p);
     }
@@ -323,7 +328,7 @@ mod tests {
         // The bed file contains both parts, inside the bed.
         let bed = crate::io::threemf::read(&std::fs::read(&r.files[0]).unwrap()).unwrap();
         let bb = bed.bbox();
-        assert!(bb.min.x >= 0.0 && bb.max.x <= s.printer.printer.volume[0] && bb.min.z.abs() < 1e-3, "{bb:?}");
+        assert!(bb.min.x >= 0.0 && bb.max.x <= s.printer.volume[0] && bb.min.z.abs() < 1e-3, "{bb:?}");
         assert!((bed.volume() - 120.0 * 80.0 * 60.0).abs() < 1.0);
         std::fs::remove_dir_all(dir).ok();
     }

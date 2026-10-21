@@ -22,18 +22,31 @@ pub struct Camera {
     pub fov_y: f32,
     /// Scene radius, used for clip planes.
     pub scene_radius: f32,
+    /// Parallel (isometric-style) projection instead of perspective. The view
+    /// then shows the same extent a perspective view would at `distance`.
+    pub ortho: bool,
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        Camera { target: Vec3::ZERO, yaw: -0.8, pitch: 0.5, distance: 500.0, fov_y: 35f32.to_radians(), scene_radius: 200.0 }
+        Camera { target: Vec3::ZERO, yaw: -0.8, pitch: 0.5, distance: 500.0, fov_y: 35f32.to_radians(), scene_radius: 200.0, ortho: false }
     }
 }
 
 impl Camera {
+    /// Direction from the target towards the eye.
+    fn back(&self) -> Vec3 {
+        Vec3::new(self.pitch.cos() * self.yaw.cos(), self.pitch.cos() * self.yaw.sin(), self.pitch.sin())
+    }
+
+    /// Distance of the actual eye: with a parallel projection it stands back
+    /// beyond the scene so nothing is clipped, whatever the zoom.
+    fn eye_distance(&self) -> f32 {
+        if self.ortho { self.distance.max(self.scene_radius * 3.0 + 10.0) } else { self.distance }
+    }
+
     pub fn eye(&self) -> Vec3 {
-        let dir = Vec3::new(self.pitch.cos() * self.yaw.cos(), self.pitch.cos() * self.yaw.sin(), self.pitch.sin());
-        self.target + dir * self.distance
+        self.target + self.back() * self.eye_distance()
     }
 
     pub fn view(&self) -> Mat4 {
@@ -41,10 +54,36 @@ impl Camera {
         glam::camera::rh::view::look_at_mat4(self.eye(), self.target, up)
     }
 
+    /// Near and far clip distances.
+    fn clip(&self) -> (f32, f32) {
+        let d = self.eye_distance();
+        let far = d + self.scene_radius * 4.0;
+        let near = if self.ortho { (d - self.scene_radius * 3.0).max(0.5) } else { (d - self.scene_radius * 2.0).max(far * 2e-3).max(0.5) };
+        (near, far)
+    }
+
     pub fn proj(&self, aspect: f32) -> Mat4 {
-        let far = self.distance + self.scene_radius * 4.0;
-        let near = (self.distance - self.scene_radius * 2.0).max(far * 1e-4).max(0.5);
+        let (near, far) = self.clip();
+        if self.ortho {
+            let h = self.distance * (self.fov_y * 0.5).tan();
+            let w = h * aspect.max(1e-3);
+            return glam::camera::rh::proj::directx::orthographic(-w, w, -h, h, near, far);
+        }
         glam::camera::rh::proj::directx::perspective(self.fov_y, aspect.max(1e-3), near, far)
+    }
+
+    /// How far lines are pulled towards the eye so lines lying on a surface
+    /// are not hidden by it: a few depth-buffer steps at their distance,
+    /// well under a wall's thickness.
+    pub fn line_bias(&self) -> [f32; 2] {
+        let (near, far) = self.clip();
+        if self.ortho {
+            // Depth is linear: the same small step everywhere.
+            [0.05 + (far - near) * 2e-6, 0.0]
+        } else {
+            // Depth precision falls off with distance² / near.
+            [0.05, (far * 1e-6 / near).min(1e-3)]
+        }
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {

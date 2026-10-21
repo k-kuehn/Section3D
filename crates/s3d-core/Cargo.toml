@@ -10,7 +10,6 @@ build = "build.rs"
 glam.workspace = true
 rayon.workspace = true
 miniz_oxide.workspace = true
-quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bytemuck.workspace = true

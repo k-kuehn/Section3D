@@ -9,6 +9,9 @@ struct Globals {
     params: vec4<f32>,
     cap_color: vec4<f32>,
     support_color: vec4<f32>,
+    // Lines are pulled towards the eye by x + y * distance (mm), so lines on
+    // a surface win without showing through thin walls.
+    line_bias: vec4<f32>,
 };
 
 struct Object {
@@ -102,6 +105,10 @@ fn fs_mesh(in: MeshOut, @builtin(front_facing) front: bool) -> @location(0) vec4
         }
     }
 
+    if ((o.flags.x & 2u) != 0u) {
+        // Selected pieces take on the highlight colour a little.
+        base = mix(base, to_linear(o.highlight.rgb), 0.22);
+    }
     var c = shade(base, n, in.world);
     if ((o.flags.x & 2u) != 0u) {
         // Selected: lift and add a rim.
@@ -133,8 +140,12 @@ fn vs_line(
     @location(2) color: vec4<f32>,
     @location(3) width: f32,
 ) -> LineOut {
-    var ca = g.view_proj * vec4<f32>(a, 1.0);
-    var cb = g.view_proj * vec4<f32>(b, 1.0);
+    let da = length(g.eye.xyz - a);
+    let db = length(g.eye.xyz - b);
+    let a2 = a + (g.eye.xyz - a) / max(da, 1e-3) * (g.line_bias.x + g.line_bias.y * da);
+    let b2 = b + (g.eye.xyz - b) / max(db, 1e-3) * (g.line_bias.x + g.line_bias.y * db);
+    var ca = g.view_proj * vec4<f32>(a2, 1.0);
+    var cb = g.view_proj * vec4<f32>(b2, 1.0);
     // Keep both ends in front of the near plane.
     let eps = 1e-4;
     if (ca.w < eps) { ca = mix(ca, cb, (eps - ca.w) / (cb.w - ca.w)); }
@@ -150,8 +161,7 @@ fn vs_line(
     let base = select(ca, cb, c.x > 0.5);
     let off = nrm * c.y / (vp * 0.5) * base.w;
     var out: LineOut;
-    // Pull lines slightly towards the camera so lines on a surface win.
-    out.pos = vec4<f32>(base.xy + off, base.z - 0.0004 * base.w, base.w);
+    out.pos = vec4<f32>(base.xy + off, base.z, base.w);
     out.color = color;
     return out;
 }

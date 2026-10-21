@@ -3,12 +3,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use eframe::egui;
 use egui::{Align, Color32, CornerRadius, Layout, RichText, Stroke, Ui, Vec2};
-use s3d_core::edits::{EditOp, EditStatus};
+use s3d_core::edits::{EditEntry, EditOp};
 use s3d_core::job::JobCtx;
 use s3d_core::partition::{Partition, PieceId};
 
-use crate::doc::{Document, Hollow, Snapshot, Source, SplitState, Status, Step, Undo};
+use crate::doc::{Document, Hollow, Source, SplitState, Status, Step, Undo};
 use crate::jobs::{JobKind, Jobs};
 use crate::theme::{self, Palette};
 use crate::view::ViewState;
@@ -17,13 +18,11 @@ use crate::{logo, panels, project, recent, view, widgets};
 pub enum JobOut {
     Imported(Source),
     Hollowed(Hollow),
-    Split(SplitState, Vec<EditStatus>),
+    Split(SplitState),
     /// Result of an incremental edit or connector update.
     /// `pin_advice`: Some(new advice) when connectors were redone for all pieces.
-    /// `appended`: the edit that produced this result (added to the edit list).
-    Updated { partition: Partition, appended: Option<(EditOp, EditStatus)>, key: u64, conn_key: Option<u64>, changed: Vec<PieceId>, pin_advice: Option<Option<s3d_core::connectors::PinAdvice>> },
-    /// A seam adjustment preview (not yet applied).
-    Preview(view::Preview),
+    /// `appended`: the log entry of the edit that produced this result.
+    Updated { partition: Partition, appended: Option<EditEntry>, key: u64, conn_key: Option<u64>, pin_advice: Option<Option<s3d_core::connectors::PinAdvice>> },
     Arranged(s3d_core::pack::Layout, u64),
     /// Export summary, plus a fresh bed layout if one had to be computed.
     Exported(String, Option<(s3d_core::pack::Layout, u64)>),
@@ -49,13 +48,14 @@ pub struct S3dApp {
     pub recent: recent::Recent,
     pub confirm_discard: Option<PendingAction>,
     pub show_settings: bool,
-    pub custom_printer: bool,
     last_autosave: std::time::Instant,
     autosave_rev: u64,
     pub close_confirmed: bool,
     /// Autosaves of sessions that crashed, offered on the start screen.
     pub recovery: Vec<PathBuf>,
     recovering: Option<PathBuf>,
+    /// The window title bar has been told the theme (Windows draws it).
+    theme_sent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -97,12 +97,12 @@ impl S3dApp {
             recent,
             confirm_discard: None,
             show_settings: false,
-            custom_printer: false,
             last_autosave: std::time::Instant::now(),
             autosave_rev: 0,
             close_confirmed: false,
             recovery: Vec::new(),
             recovering: None,
+            theme_sent: false,
         }
     }
 
@@ -132,9 +132,11 @@ impl S3dApp {
                 project::clear_autosave();
             }
             PendingAction::OpenModel(path) => {
-                let path = path.or_else(|| rfd::FileDialog::new().add_filter("3D models", s3d_core::io::MESH_EXTENSIONS).set_title("Open model").pick_file());
-                if let Some(p) = path {
-                    self.start_import(p);
+                let path = path.or_else(|| rfd::FileDialog::new().add_filter("Models and projects", &["stl", "obj", "3mf", "s3d"]).add_filter("3D models", s3d_core::io::MESH_EXTENSIONS).add_filter("Section3D project", &["s3d"]).set_title("Open model or project").pick_file());
+                match path {
+                    Some(p) if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("s3d")) => self.start_open(p),
+                    Some(p) => self.start_import(p),
+                    None => {}
                 }
             }
             PendingAction::OpenProject(path) => {
@@ -155,7 +157,6 @@ impl S3dApp {
         self.jobs.start(JobKind::Import, &ctx, move |job| {
             job.set_stage("Reading file");
             let mesh = s3d_core::io::load(&path).map_err(|e| e.to_string())?;
-            job.set_progress(0.4);
             let r = s3d_core::repair::repair(mesh, job).map_err(|e| e.to_string())?;
             let content = r.mesh.content_hash();
             Ok(JobOut::Imported(Source { name, path: Some(path), mesh: Arc::new(r.mesh), health: r.health, mesh_id: 0, content }))
@@ -182,43 +183,42 @@ impl S3dApp {
         let Some((mesh, xf)) = self.doc.prepared_mesh() else { return };
         let settings = self.doc.settings.clone();
         let zones = self.doc.zones.transformed(&xf);
-        let edits = self.doc.edits.clone();
         let keep: Vec<_> = self.doc.split.as_ref().map(|s| s.partition.pieces.iter().filter(|p| p.locked).map(|p| p.solid.clone()).collect()).unwrap_or_default();
         let keep_planes: Vec<_> = self.doc.split.as_ref().map(|s| s.partition.pieces.iter().filter(|p| p.locked).flat_map(|p| s.partition.seams_of(p.id).map(|x| x.plane)).collect()).unwrap_or_default();
         let key = self.doc.split_key();
         let conn_key = self.doc.conn_key();
         let ctx = self.ctx_handle();
-        // Live layout preview while the Triangle search runs.
+        // Live preview of the cut lines while the split runs.
         let slot = self.view.search_preview.clone();
         *slot.lock().unwrap() = None;
         let repaint = ctx.clone();
-        let preview: s3d_core::split::triangle::PreviewFn = Arc::new(move |edges, msg| {
+        let preview: s3d_core::split::PreviewFn = Arc::new(move |edges, msg| {
             *slot.lock().unwrap() = Some((Arc::new(edges), msg));
             repaint.request_repaint();
         });
         self.jobs.start(JobKind::Split, &ctx, move |job| {
-            let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh, settings: settings.clone(), zones, edits, keep, keep_planes, preview: Some(preview) }, job)?;
+            let out = s3d_core::split::run(s3d_core::split::SplitInput { mesh, settings: settings.clone(), zones, keep, keep_planes, preview: Some(preview) }, job)?;
             let mut partition = out.partition;
             let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
             s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
             let pin_advice = pin_advice(&partition, &settings);
-            Ok(JobOut::Split(SplitState { partition, key, conn_key: Some(conn_key), generation: 0, pin_advice }, out.edit_status))
+            Ok(JobOut::Split(SplitState { partition, key, conn_key: Some(conn_key), generation: 0, pin_advice }))
         });
     }
 
-    /// Re-runs connectors and part numbers on the existing pieces.
-    pub fn start_connectors(&mut self) {
+    /// Re-runs the features (dowel holes, part numbers) on the existing pieces.
+    pub fn start_features(&mut self) {
         let Some(split) = self.doc.split.clone() else { return };
         let settings = self.doc.settings.clone();
         let conn_key = self.doc.conn_key();
         let key = split.key;
         let ctx = self.ctx_handle();
-        self.jobs.start(JobKind::Connectors, &ctx, move |job| {
+        self.jobs.start(JobKind::Features, &ctx, move |job| {
             let mut partition = split.partition.clone();
             let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
             s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
             let advice = pin_advice(&partition, &settings);
-            Ok(JobOut::Updated { partition, appended: None, key, conn_key: Some(conn_key), changed: all, pin_advice: Some(advice) })
+            Ok(JobOut::Updated { partition, appended: None, key, conn_key: Some(conn_key), pin_advice: Some(advice) })
         });
     }
 
@@ -231,24 +231,15 @@ impl S3dApp {
     pub fn start_edit_with(&mut self, make: impl FnOnce(&JobCtx) -> Result<EditOp, String> + Send + 'static) {
         let Some(split) = self.doc.split.clone() else { return };
         let settings = self.doc.settings.clone();
-        let mut edits = self.doc.edits.clone();
+        let zones = self.doc.placement().map(|xf| self.doc.zones.transformed(&xf)).unwrap_or_default();
         let conn = split.conn_key;
-        // If the pieces were current, they stay current with the new edit;
-        // otherwise keep the old key so the step still shows out of date.
-        let was_current = self.doc.status(Step::Split) == Status::Done;
-        let parts = self.doc.split_key_parts();
-        let old_key = split.key;
+        // Edits are not inputs of the split, so its status stays as it was.
+        let key = split.key;
         let ctx = self.ctx_handle();
         self.jobs.start(JobKind::Edit, &ctx, move |job| {
             let op = make(job)?;
             let mut partition = split.partition.clone();
-            let (st, changed) = s3d_core::edits::apply(&mut partition, &op);
-            if let EditStatus::Failed(e) = &st {
-                return Err(e.clone());
-            }
-            if st == EditStatus::Orphaned {
-                return Err("the piece or cut no longer exists".into());
-            }
+            let (changed, entry) = s3d_core::edits::apply(&mut partition, op)?;
             // Neighbours of changed pieces may have gained or lost cut faces.
             let mut touched = changed.clone();
             for id in &changed {
@@ -256,20 +247,36 @@ impl S3dApp {
             }
             touched.sort_unstable();
             touched.dedup();
-            let params = s3d_core::split::orient_params(&settings);
-            s3d_core::split::orient_pieces(&mut partition, &touched, &params);
+            s3d_core::split::check_pieces(&mut partition, &touched, &settings, &zones);
             if conn.is_some() {
-                // Pin directions follow the global assembly order, which an
-                // edit can change anywhere: re-finish every piece so both
-                // halves of each hole pair always match.
-                let all: Vec<PieceId> = partition.pieces.iter().map(|p| p.id).collect();
-                s3d_core::connectors::finish(&mut partition, &all, &settings, job)?;
-                touched = all;
+                // Pins are drilled square to each cut, so only the changed
+                // pieces and their neighbours need new holes.
+                s3d_core::connectors::finish(&mut partition, &touched, &settings, job)?;
             }
-            s3d_core::split::flag_assembly(&mut partition);
-            edits.push(op.clone());
-            let key = if was_current { parts.key(&edits) } else { old_key };
-            Ok(JobOut::Updated { partition, appended: Some((op, st)), key, conn_key: conn, changed: touched, pin_advice: None })
+            Ok(JobOut::Updated { partition, appended: Some(entry), key, conn_key: conn, pin_advice: None })
+        });
+    }
+
+    /// Moves a piece's part number to the other side (convex or concave).
+    pub fn start_flip_label(&mut self, id: PieceId) {
+        let Some(split) = self.doc.split.clone() else { return };
+        let settings = self.doc.settings.clone();
+        let (key, conn) = (split.key, split.conn_key);
+        let ctx = self.ctx_handle();
+        self.jobs.start(JobKind::Features, &ctx, move |job| {
+            let mut partition = split.partition.clone();
+            let q = partition.piece_mut(id).ok_or("the piece no longer exists")?;
+            let want = !q.label_place.as_ref().ok_or("this piece has no part number")?.convex;
+            // Ask for that side: the global choice, flipped when it differs.
+            q.label_flip = (settings.connectors.label_face == s3d_core::settings::LabelFace::Convex) != want;
+            s3d_core::connectors::finish(&mut partition, &[id], &settings, job)?;
+            let side = |c: bool| if c { "convex (outside)" } else { "concave (inside)" };
+            match partition.piece(id).and_then(|q| q.label_place.as_ref()) {
+                Some(l) if l.on_cut => return Err("this piece has no room for its number on either side, so it is cut into a cut face".into()),
+                Some(l) if l.convex == want => {}
+                _ => return Err(format!("there is no room for the number on the {} side of this piece", side(want))),
+            }
+            Ok(JobOut::Updated { partition, appended: None, key, conn_key: conn, pin_advice: None })
         });
     }
 
@@ -300,7 +307,10 @@ impl S3dApp {
                 None
             };
             let l = fresh.as_ref().map(|f| &f.0).unwrap_or(&layout);
-            let msg = crate::export::run(&folder, &title, &split.partition, l, &settings, job)?;
+            if l.beds.is_empty() && !split.partition.pieces.is_empty() {
+                return Err("no pieces fit on a bed".into());
+            }
+            let msg = s3d_core::export::run(&folder, &title, &split.partition, l, &settings, job)?.summary();
             Ok(JobOut::Exported(msg, fresh))
         });
     }
@@ -368,43 +378,40 @@ impl S3dApp {
                 self.doc.dirty = true;
                 self.notice = Some(Notice::Info("Model hollowed.".into()));
             }
-            JobOut::Split(mut st, status) => {
+            JobOut::Split(mut st) => {
                 st.generation = self.doc.new_id();
                 let n = st.partition.pieces.len();
                 let flagged = st.partition.pieces.iter().filter(|p| p.flags.iter().any(|f| *f != s3d_core::partition::Flag::SkippedDowel)).count();
                 let pins_skipped = st.partition.pieces.iter().filter(|p| p.flags.contains(&s3d_core::partition::Flag::SkippedDowel)).count();
                 self.doc.split = Some(Arc::new(st));
-                let orphaned = status.iter().filter(|s| **s != EditStatus::Applied).count();
-                self.doc.edit_status = status;
+                // A fresh split starts over: earlier manual edits are gone.
+                self.doc.edits.clear();
                 self.doc.dirty = true;
                 self.view.on_new_split();
-                self.notice = Some(if orphaned > 0 {
-                    Notice::Warn(format!("Split into {n} pieces. {orphaned} manual edit(s) could not be re-applied."))
-                } else if flagged > 0 {
-                    Notice::Warn(format!("Split into {n} pieces. {flagged} piece(s) need attention."))
+                self.notice = Some(if flagged > 0 {
+                    // The live count is in the link next to it.
+                    Notice::Warn(format!("Split into {n} pieces."))
                 } else if pins_skipped > 0 {
-                    Notice::Warn(format!("Split into {n} pieces. Pins were skipped on {pins_skipped} piece(s) — see Connectors."))
+                    Notice::Warn(format!("Split into {n} pieces. Pins were skipped on {pins_skipped} piece(s) — see Features."))
                 } else {
-                    Notice::Info(format!("Split into {n} pieces. All pieces fit and print without supports."))
+                    Notice::Info(format!("Split into {n} pieces. All pieces fit, print without supports and pass every shape check."))
                 });
                 self.view.arrange_needed = true;
             }
-            JobOut::Updated { partition, appended, key, conn_key, changed, pin_advice } => {
+            JobOut::Updated { partition, appended, key, conn_key, pin_advice } => {
                 let Some(old) = &self.doc.split else { return };
                 let pin_advice = pin_advice.unwrap_or(old.pin_advice);
-                if let Some((op, st)) = appended {
-                    self.doc.edits.push(op);
-                    self.doc.edit_status.push(st);
+                if let Some(e) = appended {
+                    self.doc.edits.push(e);
                 }
                 // New generation: GPU and picking caches must not reuse ids
                 // across results (revisions can repeat after undo).
                 let generation = self.doc.new_id();
                 self.doc.split = Some(Arc::new(SplitState { partition, key, conn_key, generation, pin_advice }));
                 self.doc.dirty = true;
-                self.view.on_pieces_changed(&changed);
+                self.view.on_pieces_changed();
                 self.view.arrange_needed = true;
             }
-            JobOut::Preview(p) => self.view.preview = Some(p),
             JobOut::Arranged(layout, key) => {
                 let unplaced = layout.unplaced.len();
                 self.view.set_arrangement(layout, key);
@@ -419,7 +426,6 @@ impl S3dApp {
                     self.view.set_arrangement(layout, key);
                 }
                 self.doc.exported_key = Some(self.doc.export_key_basic());
-                self.recent.add_export(format!("{} - {}", utc_now(), msg));
                 self.notice = Some(Notice::Info(msg));
             }
             JobOut::Saved(path) => {
@@ -479,6 +485,12 @@ impl S3dApp {
     pub fn ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let _ = crate::CTX.set(ctx.clone());
+        if !self.theme_sent {
+            // The title bar is drawn by Windows: tell it the theme once the
+            // window exists, or a dark app starts with a light title bar.
+            self.theme_sent = true;
+            theme::apply(&ctx, self.dark);
+        }
         if let Some((kind, res)) = self.jobs.poll() {
             self.handle_job_result(kind, res);
         }
@@ -664,7 +676,7 @@ impl S3dApp {
                 if ui.button("Settings").clicked() {
                     self.show_settings = !self.show_settings;
                 }
-                panels::printer_picker(self, ui);
+                panels::printer_button(self, ui);
             });
         });
     }
@@ -673,17 +685,10 @@ impl S3dApp {
         let p = self.palette();
         ui.horizontal(|ui| {
             ui.set_min_height(22.0);
+            // Progress of a running job is shown under the 3D view.
             if let Some(r) = &self.jobs.current {
-                let frac = r.ctx.progress();
-                let stage = r.ctx.stage();
                 ui.add(egui::Spinner::new().size(14.0).color(p.accent));
-                ui.label(RichText::new(format!("{} — {}", r.kind.label(), stage)).color(p.text));
-                ui.add(egui::ProgressBar::new(frac).desired_width(220.0).desired_height(8.0).fill(p.accent).corner_radius(CornerRadius::same(4)));
-                ui.label(RichText::new(format!("{:.0}%  ·  {:.1} s", frac * 100.0, r.started.elapsed().as_secs_f32())).color(p.text_weak));
-                if ui.button("Cancel").clicked() {
-                    self.jobs.cancel();
-                    self.notice = Some(Notice::Info("Cancelled.".into()));
-                }
+                ui.label(RichText::new(r.kind.label()).color(p.text));
                 return;
             }
             let (icon, color, text) = match &self.notice {
@@ -694,6 +699,13 @@ impl S3dApp {
             };
             ui.label(RichText::new(icon).color(color));
             ui.label(RichText::new(text).color(color));
+            let flagged = self.doc.split.as_ref().map(|s| s.partition.pieces.iter().filter(|q| crate::parts::needs_attention(q)).count()).unwrap_or(0);
+            if flagged > 0 && !self.view.attention && ui.link(format!("List the {flagged} that need attention")).clicked() {
+                self.view.attention = true;
+                if !matches!(self.step, Step::Split | Step::Features | Step::Export) {
+                    self.step = Step::Split;
+                }
+            }
             if self.notice.is_some() {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
@@ -707,7 +719,7 @@ impl S3dApp {
     fn default_status(&self) -> String {
         match &self.doc.split {
             Some(s) => {
-                let flagged = s.partition.pieces.iter().filter(|p| p.flags.iter().any(|f| *f != s3d_core::partition::Flag::SkippedDowel)).count();
+                let flagged = s.partition.pieces.iter().filter(|q| crate::parts::needs_attention(q)).count();
                 if flagged == 0 { format!("{} pieces · no errors or warnings", s.partition.pieces.len()) } else { format!("{} pieces · {flagged} need attention", s.partition.pieces.len()) }
             }
             None => "No errors or warnings".into(),
@@ -812,26 +824,6 @@ impl S3dApp {
         self.doc.status(step)
     }
 
-    pub fn restore_snapshot(&mut self, s: Snapshot) {
-        self.doc.restore(s);
-    }
-}
-
-/// Current UTC time as "YYYY-MM-DD HH:MM UTC" (std has no time zones).
-fn utc_now() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
-    let (days, tod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Days to civil date (H. Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", tod / 3600, (tod % 3600) / 60)
 }
 
 /// Pin size advice, only when some pins had to be skipped.

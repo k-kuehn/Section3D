@@ -60,7 +60,6 @@ int s3d_mf_is_empty(const S3dMf* h) { return h->m.IsEmpty() ? 1 : 0; }
 uint64_t s3d_mf_num_tri(const S3dMf* h) { return h->m.NumTri(); }
 uint64_t s3d_mf_num_vert(const S3dMf* h) { return h->m.NumVert(); }
 double s3d_mf_volume(const S3dMf* h) { return h->m.Volume(); }
-double s3d_mf_surface_area(const S3dMf* h) { return h->m.SurfaceArea(); }
 int s3d_mf_genus(const S3dMf* h) { return h->m.Genus(); }
 
 void s3d_mf_bbox(const S3dMf* h, double* out6) {

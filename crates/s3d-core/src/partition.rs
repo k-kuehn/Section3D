@@ -33,8 +33,17 @@ pub enum Flag {
     Small,
     /// A dowel hole was skipped because the wall was too thin.
     SkippedDowel,
-    /// No clear path to insert during assembly.
+    /// No clear path to insert during assembly (no longer produced; kept so
+    /// older projects still load).
     NoAssemblyPath,
+    /// A corner or cut edge sharper than the minimum angle (feather edge).
+    Sharp,
+    /// Part of the piece is a strip thinner than the minimum thickness.
+    Thin,
+    /// A seam of this piece continues straight into a neighbouring seam.
+    Aligned,
+    /// A cut face of this piece runs through a painted no-cut zone.
+    InZone,
 }
 
 impl Flag {
@@ -46,6 +55,10 @@ impl Flag {
             Flag::Small => "SMALL",
             Flag::SkippedDowel => "PIN SKIPPED",
             Flag::NoAssemblyPath => "NO PATH",
+            Flag::Sharp => "SHARP",
+            Flag::Thin => "THIN",
+            Flag::Aligned => "ALIGNED",
+            Flag::InZone => "NO-CUT ZONE",
         }
     }
     pub fn explain(&self) -> String {
@@ -56,10 +69,11 @@ impl Flag {
             Flag::Small => "Smaller than the minimum piece size and could not be merged.".into(),
             Flag::SkippedDowel => "A dowel hole was skipped where the wall is too thin.".into(),
             Flag::NoAssemblyPath => "Cannot be slid into place after its neighbours; assemble it earlier or glue without pins.".into(),
+            Flag::Sharp => "Has a corner or cut edge sharper than the minimum angle; it may chip or print poorly.".into(),
+            Flag::Thin => "Part of it is narrower than the minimum thickness.".into(),
+            Flag::Aligned => "One of its cuts lines up with a neighbouring cut, making a long straight seam.".into(),
+            Flag::InZone => "One of its cuts runs through an area painted as a no-cut zone.".into(),
         }
-    }
-    pub fn is_error(&self) -> bool {
-        matches!(self, Flag::TooBig)
     }
 }
 
@@ -97,11 +111,19 @@ pub struct Piece {
     pub volume: f64,
     pub centroid: Vec3,
     pub bbox: Aabb,
+    /// Put the part number on the other side than the global choice.
+    pub label_flip: bool,
+    /// Where the part number was placed by the last features run.
+    pub label_place: Option<crate::labels::LabelPlace>,
 }
 
 impl Piece {
     pub fn new(id: PieceId, solid: Solid, rev: u64) -> Piece {
         let mesh = solid.to_mesh();
+        // Rebuild the solid from its mesh: this drops the boolean history the
+        // geometry kernel keeps, which otherwise grows with every re-cut and
+        // makes later operations on the piece ever slower.
+        let solid = Solid::from_mesh(&mesh).unwrap_or(solid);
         Piece::from_parts(id, Arc::new(solid), Arc::new(mesh), rev)
     }
 
@@ -109,7 +131,7 @@ impl Piece {
         let volume = solid.volume();
         let bbox = mesh.bbox();
         let centroid = mesh.centroid();
-        Piece { id, solid, mesh, finished: None, rev, locked: false, label: id + 1, orient: None, flags: Vec::new(), volume, centroid, bbox }
+        Piece { id, solid, mesh, finished: None, rev, locked: false, label: id + 1, orient: None, flags: Vec::new(), volume, centroid, bbox, label_flip: false, label_place: None }
     }
 
     /// Mesh to export/show: finished if available.
@@ -294,11 +316,6 @@ impl Partition {
         n
     }
 
-    /// Distinct planes of all current seams.
-    pub fn seam_planes(&self) -> Vec<Plane> {
-        dedup_planes(self.seams.iter().map(|s| s.plane))
-    }
-
     fn take_rev(&mut self) -> u64 {
         self.next_rev += 1;
         self.next_rev
@@ -368,7 +385,7 @@ impl Partition {
 
     /// Replaces `old` pieces by `new` solids and refreshes seams around them.
     /// `extra_planes` are planes the new pieces were just cut with.
-    fn replace(&mut self, old: &[PieceId], new: Vec<Solid>, extra_planes: &[Plane]) -> Vec<PieceId> {
+    pub fn replace(&mut self, old: &[PieceId], new: Vec<Solid>, extra_planes: &[Plane]) -> Vec<PieceId> {
         let mut planes: Vec<Plane> = self.seams.iter().filter(|s| old.iter().any(|o| s.touches(*o))).map(|s| s.plane).collect();
         planes.extend_from_slice(extra_planes);
         let mut neighbours: Vec<PieceId> = old.iter().flat_map(|o| self.neighbours(*o)).filter(|n| !old.contains(n)).collect();
@@ -402,7 +419,8 @@ impl Partition {
         let (a, b) = p.solid.split_by_plane(plane.normal, plane.offset)?;
         let mut parts = a.bodies();
         parts.extend(b.bodies());
-        parts.retain(|s| !s.is_empty());
+        // Slivers of zero volume (a plane grazing a face) are not pieces.
+        parts.retain(|s| !s.is_empty() && s.volume() > 1e-3);
         if parts.len() <= 1 {
             return Ok(vec![id]);
         }
@@ -428,7 +446,8 @@ impl Partition {
         let (x, y) = u.split_by_plane(plane.normal, plane.offset)?;
         let mut parts = x.bodies();
         parts.extend(y.bodies());
-        parts.retain(|s| !s.is_empty());
+        // Slivers of zero volume (a plane grazing a face) are not pieces.
+        parts.retain(|s| !s.is_empty() && s.volume() > 1e-3);
         Ok(self.replace(&[s.a, s.b], parts, &[plane]))
     }
 

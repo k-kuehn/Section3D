@@ -8,7 +8,7 @@ use glam::Vec3;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::edits::{EditOp, EditStatus};
+use crate::edits::EditEntry;
 use crate::io::zip::{ZipReader, ZipWriter};
 use crate::job::JobCtx;
 use crate::manifold::Solid;
@@ -35,8 +35,8 @@ pub struct SplitData {
 
 pub struct ProjectData {
     pub settings: Settings,
-    pub edits: Vec<EditOp>,
-    pub edit_status: Vec<EditStatus>,
+    /// Manual edits made since the split (a log; they are not replayed).
+    pub edit_log: Vec<EditEntry>,
     pub zones: Zones,
     pub source: Option<SourceData>,
     pub hollow: Option<(u64, Arc<Mesh>)>,
@@ -54,6 +54,10 @@ struct PieceMeta {
     flags: Vec<Flag>,
     orient: Option<Orientation>,
     finished: bool,
+    #[serde(default)]
+    label_flip: bool,
+    #[serde(default)]
+    label_place: Option<crate::labels::LabelPlace>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,8 +65,8 @@ struct Manifest {
     version: u32,
     app: String,
     settings: Settings,
-    edits: Vec<EditOp>,
-    edit_status: Vec<EditStatus>,
+    #[serde(default)]
+    edit_log: Vec<EditEntry>,
     zones: Zones,
     source: Option<(String, Option<String>, Health)>,
     hollow_key: Option<u64>,
@@ -113,7 +117,7 @@ pub fn save(path: &Path, d: &ProjectData, job: &JobCtx) -> Result<(), String> {
     let split_meta = d.split.as_ref().map(|s| SplitMeta {
         key: s.key,
         conn_key: s.conn_key,
-        pieces: s.partition.pieces.iter().map(|p| PieceMeta { id: p.id, label: p.label, locked: p.locked, rev: p.rev, flags: p.flags.clone(), orient: p.orient, finished: p.finished.is_some() }).collect(),
+        pieces: s.partition.pieces.iter().map(|p| PieceMeta { id: p.id, label: p.label, locked: p.locked, rev: p.rev, flags: p.flags.clone(), orient: p.orient, finished: p.finished.is_some(), label_flip: p.label_flip, label_place: p.label_place.clone() }).collect(),
         seams: s.partition.seams.clone(),
         next_piece: s.partition.next_piece,
         next_seam: s.partition.next_seam,
@@ -123,8 +127,7 @@ pub fn save(path: &Path, d: &ProjectData, job: &JobCtx) -> Result<(), String> {
         version: FORMAT_VERSION,
         app: format!("Section3D {}", env!("CARGO_PKG_VERSION")),
         settings: d.settings.clone(),
-        edits: d.edits.clone(),
-        edit_status: d.edit_status.clone(),
+        edit_log: d.edit_log.clone(),
         zones: d.zones.clone(),
         source: d.source.as_ref().map(|s| (s.name.clone(), s.path.clone(), s.health.clone())),
         hollow_key: d.hollow.as_ref().map(|h| h.0),
@@ -148,19 +151,16 @@ pub fn save(path: &Path, d: &ProjectData, job: &JobCtx) -> Result<(), String> {
         }
     }
     let packed: Vec<(String, Vec<u8>)> = blobs.par_iter().map(|(n, m)| (n.clone(), mesh_to_bytes(m))).collect();
-    job.set_progress(0.4);
     let mut z = ZipWriter::new();
     z.add("manifest.json", &serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?, true);
-    for (i, (n, b)) in packed.iter().enumerate() {
+    for (n, b) in &packed {
         job.check().map_err(|e| e.to_string())?;
         z.add_level(n, b, 1);
-        job.step(0.4, 0.95, i, packed.len());
     }
     let bytes = z.finish();
     let tmp = path.with_extension("s3d.tmp");
     std::fs::write(&tmp, &bytes).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    job.set_progress(1.0);
     Ok(())
 }
 
@@ -181,7 +181,6 @@ pub fn load(path: &Path, job: &JobCtx) -> Result<ProjectData, String> {
         Some(k) => Some((k, Arc::new(read_mesh("hollow.bin")?))),
         None => None,
     };
-    job.set_progress(0.3);
     let split = match manifest.split {
         Some(sm) => {
             job.set_stage("Loading pieces");
@@ -204,6 +203,8 @@ pub fn load(path: &Path, job: &JobCtx) -> Result<ProjectData, String> {
                     p.locked = m.locked;
                     p.flags = m.flags;
                     p.orient = m.orient;
+                    p.label_flip = m.label_flip;
+                    p.label_place = m.label_place;
                     p.finished = match f {
                         Some(b) => Some(Arc::new(mesh_from_bytes(&b)?)),
                         None => None,
@@ -216,8 +217,7 @@ pub fn load(path: &Path, job: &JobCtx) -> Result<ProjectData, String> {
         }
         None => None,
     };
-    job.set_progress(1.0);
-    Ok(ProjectData { settings: manifest.settings, edits: manifest.edits, edit_status: manifest.edit_status, zones: manifest.zones, source, hollow, split, extra: manifest.extra })
+    Ok(ProjectData { settings: manifest.settings, edit_log: manifest.edit_log, zones: manifest.zones, source, hollow, split, extra: manifest.extra })
 }
 
 #[cfg(test)]
@@ -234,8 +234,7 @@ mod tests {
         let src = Arc::new(crate::mesh::shapes::cube(Vec3::splat(50.0)));
         let d = ProjectData {
             settings: Settings::default(),
-            edits: vec![],
-            edit_status: vec![],
+            edit_log: vec![],
             zones: Zones::default(),
             source: Some(SourceData { name: "cube".into(), path: None, health: Health::Clean, mesh: src }),
             hollow: None,

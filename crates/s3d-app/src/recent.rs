@@ -1,4 +1,4 @@
-//! Small persistent app config: recent projects and theme.
+//! Small persistent app config: recent projects, theme and projection.
 //!
 //! Stored in `%APPDATA%\Section3D\config.json`, or next to the executable when
 //! a file named `portable` sits beside it.
@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 pub struct Recent {
     pub projects: Vec<PathBuf>,
     pub dark: bool,
-    pub export_history: Vec<String>,
-    pub custom_printers: Vec<s3d_core::printers::Printer>,
+    /// 3D views use a parallel (isometric) projection.
+    pub ortho: bool,
 }
 
 impl Default for Recent {
     fn default() -> Self {
-        Recent { projects: Vec::new(), dark: true, export_history: Vec::new(), custom_printers: Vec::new() }
+        Recent { projects: Vec::new(), dark: true, ortho: false }
     }
 }
 
@@ -57,12 +57,6 @@ impl Recent {
         self.projects.retain(|q| q != p);
         self.projects.insert(0, p.to_path_buf());
         self.projects.truncate(12);
-        self.save();
-    }
-
-    pub fn add_export(&mut self, line: String) {
-        self.export_history.insert(0, line);
-        self.export_history.truncate(30);
         self.save();
     }
 }

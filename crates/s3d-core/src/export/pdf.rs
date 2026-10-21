@@ -59,11 +59,6 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// Approximate Helvetica width (points) for layout.
-pub fn text_width(s: &str, size: f32) -> f32 {
-    s.chars().count() as f32 * size * 0.52
-}
-
 #[derive(Default)]
 pub struct Pdf {
     pub pages: Vec<Page>,

@@ -1,5 +1,6 @@
 //! Visual theme: colours, fonts and spacing with Section3D branding.
 
+use eframe::egui;
 use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke, TextStyle, Visuals};
 
 #[derive(Clone, Copy, Debug)]
@@ -170,6 +171,7 @@ fn visuals(p: &Palette) -> Visuals {
 pub fn apply(ctx: &egui::Context, dark: bool) {
     let p = if dark { DARK } else { LIGHT };
     ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(if dark { egui::SystemTheme::Dark } else { egui::SystemTheme::Light }));
     let theme = if dark { egui::Theme::Dark } else { egui::Theme::Light };
     ctx.style_mut_of(theme, |s| {
         s.visuals = visuals(&p);

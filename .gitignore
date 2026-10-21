@@ -1,3 +1,6 @@
 /target
 *.s3d.autosave
 /samples
+# Local projects and exports
+/*.s3d
+/example

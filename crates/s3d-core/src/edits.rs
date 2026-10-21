@@ -1,166 +1,130 @@
-//! Manual edits, kept as a list and replayed after every split.
-//!
-//! Edits refer to pieces and seams by id plus a geometric fingerprint, so they
-//! still find their target when a re-split renumbers pieces.
+//! Manual edits on the current pieces. They change only the pieces they
+//! touch and are not replayed: a fresh split starts over. Each applied edit
+//! leaves an entry in the edit log, with the part numbers involved.
 
-use glam::{DVec3, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::partition::{Partition, PieceId, SeamId};
+use crate::manifold::Solid;
+use crate::partition::{Partition, PieceId};
 use crate::plane::Plane;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PieceRef {
-    pub id: PieceId,
-    pub centroid: Vec3,
-    pub volume: f64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SeamRef {
-    pub id: SeamId,
-    pub center: Vec3,
-    pub normal: DVec3,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EditOp {
-    Merge { pieces: Vec<PieceRef> },
-    /// Splits one piece with an extra cut (re-split / add cut / fix support).
-    Cut { piece: PieceRef, plane: Plane },
-    /// Moves and/or tilts one seam; only its two pieces change.
-    MoveSeam { seam: SeamRef, plane: Plane },
-    LockPiece { piece: PieceRef, locked: bool },
-    LockSeam { seam: SeamRef, locked: bool },
+    Merge(Vec<PieceId>),
+    /// Splits one piece with an extra cut.
+    Cut(PieceId, Plane),
+    Lock(PieceId, bool),
+    /// Replaces pieces with bodies worked out in the background (for example
+    /// two neighbours merged and divided again); `planes` are the new cuts.
+    Replace { old: Vec<PieceId>, new: Vec<Solid>, planes: Vec<Plane> },
 }
 
-impl EditOp {
-    pub fn describe(&self) -> String {
-        match self {
-            EditOp::Merge { pieces } => format!("Merge {} pieces", pieces.len()),
-            EditOp::Cut { .. } => "Add cut".into(),
-            EditOp::MoveSeam { .. } => "Adjust cut".into(),
-            EditOp::LockPiece { locked, .. } => (if *locked { "Lock piece" } else { "Unlock piece" }).into(),
-            EditOp::LockSeam { locked, .. } => (if *locked { "Lock cut" } else { "Unlock cut" }).into(),
-        }
-    }
-}
-
+/// One line of the edit log.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum EditStatus {
-    Applied,
-    /// Target not found after re-splitting.
-    Orphaned,
-    /// Target is locked or the geometry operation failed.
-    Failed(String),
+pub struct EditEntry {
+    pub text: String,
+    /// Pieces the edit produced (or changed).
+    pub pieces: Vec<PieceId>,
 }
 
-impl PieceRef {
-    pub fn of(p: &Partition, id: PieceId) -> Option<PieceRef> {
-        p.piece(id).map(|q| PieceRef { id, centroid: q.centroid, volume: q.volume })
+fn names(p: &Partition, ids: &[PieceId]) -> String {
+    let mut l: Vec<u32> = ids.iter().filter_map(|i| p.piece(*i)).map(|q| q.label).collect();
+    l.sort_unstable();
+    let v: Vec<String> = l.iter().map(|x| format!("#{x}")).collect();
+    match v.len() {
+        0 => String::new(),
+        1 => v[0].clone(),
+        n => format!("{} and {}", v[..n - 1].join(", "), v[n - 1]),
     }
+}
 
-    /// Finds the piece: same id with a matching centroid, else nearest centroid.
-    pub fn resolve(&self, p: &Partition) -> Option<PieceId> {
-        let tol = (self.volume.max(1.0).cbrt() * 0.25) as f32;
-        if let Some(q) = p.piece(self.id) {
-            if q.centroid.distance(self.centroid) < tol {
-                return Some(q.id);
-            }
+/// Numbers the pieces that replaced `old`: the first keeps the lowest old
+/// number, the others get new numbers after the highest in use.
+fn renumber(p: &mut Partition, old_labels: &[u32], new: &[PieceId]) {
+    let mut next = p.pieces.iter().filter(|q| !new.contains(&q.id)).map(|q| q.label).max().unwrap_or(0).max(old_labels.iter().copied().max().unwrap_or(0));
+    let mut keep: Vec<u32> = old_labels.to_vec();
+    keep.sort_unstable();
+    let mut keep = keep.into_iter();
+    for id in new {
+        let label = keep.next().unwrap_or_else(|| {
+            next += 1;
+            next
+        });
+        if let Some(q) = p.piece_mut(*id) {
+            q.label = label;
         }
-        p.pieces
-            .iter()
-            .map(|q| (q.centroid.distance(self.centroid), q))
-            .filter(|(d, q)| *d < tol && (q.volume / self.volume.max(1e-9) - 1.0).abs() < 0.35)
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, q)| q.id)
     }
 }
 
-impl SeamRef {
-    pub fn of(p: &Partition, id: SeamId) -> Option<SeamRef> {
-        p.seam(id).map(|s| SeamRef { id, center: s.center, normal: s.plane.normal })
+fn replace(p: &mut Partition, old: &[PieceId], f: impl FnOnce(&mut Partition) -> Result<Vec<PieceId>, String>) -> Result<Vec<PieceId>, String> {
+    if old.iter().any(|id| p.piece(*id).is_none()) {
+        return Err("the piece no longer exists".into());
     }
-
-    pub fn resolve(&self, p: &Partition) -> Option<SeamId> {
-        let ok = |s: &crate::partition::Seam| s.plane.normal.dot(self.normal).abs() > 0.995;
-        if let Some(s) = p.seam(self.id) {
-            if ok(s) && s.center.distance(self.center) < 5.0 {
-                return Some(s.id);
-            }
-        }
-        p.seams
-            .iter()
-            .filter(|s| ok(s))
-            .map(|s| (s.center.distance(self.center), s))
-            .filter(|(d, _)| *d < 30.0)
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, s)| s.id)
+    if old.iter().any(|id| p.piece(*id).is_some_and(|q| q.locked)) {
+        return Err("a piece is locked".into());
     }
+    let labels: Vec<u32> = old.iter().filter_map(|id| p.piece(*id)).map(|q| q.label).collect();
+    let ids = f(p)?;
+    renumber(p, &labels, &ids);
+    Ok(ids)
 }
 
-/// Applies one edit. Returns the ids of pieces whose geometry changed.
-pub fn apply(p: &mut Partition, op: &EditOp) -> (EditStatus, Vec<PieceId>) {
-    let locked_piece = |p: &Partition, id: PieceId| p.piece(id).is_some_and(|q| q.locked);
+/// Applies one edit. Returns the pieces whose geometry changed and the log entry.
+pub fn apply(p: &mut Partition, op: EditOp) -> Result<(Vec<PieceId>, EditEntry), String> {
     match op {
-        EditOp::Merge { pieces } => {
-            let ids: Option<Vec<PieceId>> = pieces.iter().map(|r| r.resolve(p)).collect();
-            let Some(ids) = ids else { return (EditStatus::Orphaned, vec![]) };
-            if ids.iter().any(|i| locked_piece(p, *i)) {
-                return (EditStatus::Failed("a piece is locked".into()), vec![]);
-            }
-            match p.merge(&ids) {
-                Ok(id) => (EditStatus::Applied, vec![id]),
-                Err(e) => (EditStatus::Failed(e.to_string()), vec![]),
-            }
+        EditOp::Merge(ids) => {
+            let before = names(p, &ids);
+            let new = replace(p, &ids, |p| p.merge(&ids).map(|id| vec![id]).map_err(|e| e.to_string()))?;
+            let text = format!("Merged {before} into {}", names(p, &new));
+            Ok((new.clone(), EditEntry { text, pieces: new }))
         }
-        EditOp::Cut { piece, plane } => {
-            let Some(id) = piece.resolve(p) else { return (EditStatus::Orphaned, vec![]) };
-            if locked_piece(p, id) {
-                return (EditStatus::Failed("piece is locked".into()), vec![]);
+        EditOp::Cut(id, plane) => {
+            let before = names(p, &[id]);
+            let new = replace(p, &[id], |p| p.split_piece(id, plane).map_err(|e| e.to_string()))?;
+            if new.len() < 2 {
+                return Err("the cut does not divide the piece".into());
             }
-            match p.split_piece(id, *plane) {
-                Ok(ids) => (EditStatus::Applied, ids),
-                Err(e) => (EditStatus::Failed(e.to_string()), vec![]),
-            }
+            let text = format!("Cut {before} into {}", names(p, &new));
+            Ok((new.clone(), EditEntry { text, pieces: new }))
         }
-        EditOp::MoveSeam { seam, plane } => {
-            let Some(id) = seam.resolve(p) else { return (EditStatus::Orphaned, vec![]) };
-            let s = p.seam(id).unwrap();
-            if s.locked || locked_piece(p, s.a) || locked_piece(p, s.b) {
-                return (EditStatus::Failed("cut is locked".into()), vec![]);
-            }
-            match p.recut_seam(id, *plane) {
-                Ok(ids) => (EditStatus::Applied, ids),
-                Err(e) => (EditStatus::Failed(e.to_string()), vec![]),
-            }
+        EditOp::Replace { old, new, planes } => {
+            let before = names(p, &old);
+            let ids = replace(p, &old, |p| Ok(p.replace(&old, new, &planes)))?;
+            let text = if ids.len() == old.len() { format!("Re-cut {before}") } else { format!("Re-cut {before} into {}", names(p, &ids)) };
+            Ok((ids.clone(), EditEntry { text, pieces: ids }))
         }
-        EditOp::LockPiece { piece, locked } => {
-            let Some(id) = piece.resolve(p) else { return (EditStatus::Orphaned, vec![]) };
-            p.piece_mut(id).unwrap().locked = *locked;
-            (EditStatus::Applied, vec![])
-        }
-        EditOp::LockSeam { seam, locked } => {
-            let Some(id) = seam.resolve(p) else { return (EditStatus::Orphaned, vec![]) };
-            p.seams.iter_mut().find(|s| s.id == id).unwrap().locked = *locked;
-            (EditStatus::Applied, vec![])
+        EditOp::Lock(id, locked) => {
+            let q = p.piece_mut(id).ok_or("the piece no longer exists")?;
+            q.locked = locked;
+            let text = format!("{} #{}", if locked { "Locked" } else { "Unlocked" }, q.label);
+            Ok((Vec::new(), EditEntry { text, pieces: vec![id] }))
         }
     }
 }
 
-/// Replays all edits in order.
-pub fn replay(p: &mut Partition, edits: &[EditOp]) -> (Vec<EditStatus>, Vec<PieceId>) {
-    let mut changed = Vec::new();
-    let st = edits
-        .iter()
-        .map(|e| {
-            let (s, c) = apply(p, e);
-            changed.extend(c);
-            s
-        })
-        .collect();
-    changed.retain(|id| p.piece(*id).is_some());
-    changed.sort_unstable();
-    changed.dedup();
-    (st, changed)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::DVec3;
+
+    #[test]
+    fn edits_keep_numbers_and_log_them() {
+        let mut p = Partition::from_solids(vec![Solid::cube(DVec3::splat(100.0), false).unwrap()]);
+        p.split_piece(0, Plane::axis(0, 50.0)).unwrap();
+        for (i, q) in p.pieces.iter_mut().enumerate() {
+            q.label = i as u32 + 1;
+        }
+        let a = p.pieces[0].id;
+        let (new, e) = apply(&mut p, EditOp::Cut(a, Plane::axis(1, 50.0))).unwrap();
+        assert_eq!(new.len(), 2);
+        let mut labels: Vec<u32> = p.pieces.iter().map(|q| q.label).collect();
+        labels.sort_unstable();
+        assert_eq!(labels, vec![1, 2, 3]);
+        assert_eq!(e.text, "Cut #1 into #1 and #3");
+        let (m, e) = apply(&mut p, EditOp::Merge(new)).unwrap();
+        assert_eq!(p.piece(m[0]).unwrap().label, 1);
+        assert_eq!(e.text, "Merged #1 and #3 into #1");
+        let (_, e) = apply(&mut p, EditOp::Lock(m[0], true)).unwrap();
+        assert_eq!(e.text, "Locked #1");
+        assert!(apply(&mut p, EditOp::Cut(m[0], Plane::axis(2, 50.0))).is_err(), "locked pieces are not edited");
+    }
 }

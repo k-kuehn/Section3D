@@ -3,13 +3,33 @@
 use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::plane::Plane;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Dab {
     /// Position in source-model coordinates.
     pub p: Vec3,
     pub radius: f32,
+    /// Surface normal where it was painted (zero for old projects); the
+    /// paint covers only surface facing the same way, not the far side of a
+    /// thin wall.
+    #[serde(default)]
+    pub n: Vec3,
+}
+
+impl Dab {
+    /// True when surface triangle `t` (same coordinates) is painted by this dab.
+    pub fn covers(&self, t: &[Vec3; 3]) -> bool {
+        let n = (t[1] - t[0]).cross(t[2] - t[0]);
+        if self.n != Vec3::ZERO && n.dot(self.n) <= 0.0 {
+            return false;
+        }
+        self.touches(t)
+    }
+
+    /// True when triangle `t` comes within the dab's radius (either side).
+    pub fn touches(&self, t: &[Vec3; 3]) -> bool {
+        crate::bvh::closest_on_tri(self.p, t).distance_squared(self.p) <= self.radius * self.radius
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -25,18 +45,7 @@ impl Zones {
     /// Dabs mapped into prepared-model coordinates.
     pub fn transformed(&self, m: &Mat4) -> Zones {
         let s = m.to_scale_rotation_translation().0.abs().max_element();
-        Zones { dabs: self.dabs.iter().map(|d| Dab { p: m.transform_point3(d.p), radius: d.radius * s }).collect() }
-    }
-
-    /// How badly a plane crosses painted areas (sum of overlap depth).
-    pub fn plane_cost(&self, pl: &Plane) -> f32 {
-        self.dabs
-            .iter()
-            .map(|d| {
-                let dist = pl.dist(d.p).abs() as f32;
-                (d.radius - dist).max(0.0) / d.radius.max(1e-3)
-            })
-            .sum()
+        Zones { dabs: self.dabs.iter().map(|d| Dab { p: m.transform_point3(d.p), radius: d.radius * s, n: m.transform_vector3(d.n).normalize_or_zero() }).collect() }
     }
 
     /// Removes dabs within `radius` of `p` (eraser).

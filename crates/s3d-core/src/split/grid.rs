@@ -1,68 +1,81 @@
-//! Grid mode: box cells sized to the printer.
-
+//! Grid mode: the model cut by planes square to X, Y and Z, evenly spaced so
+//! every cell fits the piece size, or wherever the user placed them. The
+//! pieces are only checked afterwards, never changed.
 
 use crate::bsp::Plan;
 use crate::mesh::Aabb;
 use crate::plane::Plane;
-use crate::zones::Zones;
+use crate::settings::Settings;
 
-/// Evenly spaced cut positions along one axis so that no cell exceeds `cell`.
-fn positions(lo: f32, hi: f32, cell: f32) -> Vec<f64> {
-    let ext = (hi - lo) as f64;
-    let n = (ext / cell as f64 - 1e-6).ceil().max(1.0) as usize;
-    (1..n).map(|k| lo as f64 + ext * k as f64 / n as f64).collect()
+/// Largest cell along each axis: the piece size, capped by the printer.
+fn cell(s: &Settings) -> [f32; 3] {
+    let bed = s.printer.usable();
+    [0, 1, 2].map(|a| s.split.target_size.map_or(bed[a], |t| t.min(bed[a])))
 }
 
-/// Moves each cut to avoid painted zones, staying within `slack` of its spot.
-fn nudge(axis: usize, pos: &mut [f64], slack: f64, zones: &Zones) {
-    if zones.is_empty() {
-        return;
-    }
-    for p in pos.iter_mut() {
-        let base = *p;
-        let mut best = (zones.plane_cost(&Plane::axis(axis, base)), 0.0f64);
-        if best.0 == 0.0 {
-            continue;
+/// `n` cuts spread evenly between `lo` and `hi`.
+pub fn even(lo: f32, hi: f32, n: usize) -> Vec<f32> {
+    (1..=n).map(|k| lo + (hi - lo) * k as f32 / (n + 1) as f32).collect()
+}
+
+/// Fewest cuts per axis so that no cell is longer than the piece size.
+pub fn default_counts(bb: &Aabb, s: &Settings) -> [usize; 3] {
+    let c = cell(s);
+    [0, 1, 2].map(|a| (((bb.max[a] - bb.min[a]) / c[a] - 1e-4).ceil().max(1.0) as usize) - 1)
+}
+
+/// Cut positions along X, Y and Z: the user's, or evenly spaced.
+pub fn cuts(bb: &Aabb, s: &Settings) -> [Vec<f32>; 3] {
+    match &s.split.grid {
+        Some(g) => g.clone(),
+        None => {
+            let n = default_counts(bb, s);
+            [0, 1, 2].map(|a| even(bb.min[a], bb.max[a], n[a]))
         }
-        for k in 1..=24 {
-            for sgn in [-1.0, 1.0] {
-                let d = sgn * slack * k as f64 / 24.0;
-                let c = zones.plane_cost(&Plane::axis(axis, base + d));
-                if c < best.0 - 1e-6 || (c <= best.0 + 1e-6 && d.abs() < best.1.abs()) {
-                    best = (c, d);
-                }
-            }
-        }
-        *p = base + best.1;
     }
 }
 
-/// Builds the grid plan. `cell` is the largest allowed cell size per axis.
-pub fn plan(bb: &Aabb, cell: [f32; 3], zones: &Zones) -> Plan {
-    let mut axes: Vec<Vec<f64>> = (0..3)
+/// The cutting plan: slabs along X, each cut into rows along Y, each into
+/// blocks along Z. Cuts outside the model or closer than 0.5 mm to another
+/// are skipped.
+pub fn plan(bb: &Aabb, cuts: &[Vec<f32>; 3]) -> Plan {
+    let at: Vec<Vec<f64>> = (0..3)
         .map(|a| {
-            // Shrink cells a little so nudged cuts still keep pieces within the bed.
-            let c = cell[a] * 0.92;
-            let mut p = positions(bb.min[a], bb.max[a], c);
-            // Each cut may move by half the room left in a cell, so two cuts
-            // moving apart still keep the cell within the bed.
-            let spacing = (bb.max[a] - bb.min[a]) as f64 / (p.len() + 1) as f64;
-            let slack = ((cell[a] as f64 - spacing) * 0.5 * 0.95).max(0.0);
-            nudge(a, &mut p, slack, zones);
-            p
+            let mut v: Vec<f64> = cuts[a].iter().filter(|x| **x > bb.min[a] + 0.5 && **x < bb.max[a] - 0.5).map(|x| *x as f64).collect();
+            v.sort_by(f64::total_cmp);
+            v.dedup_by(|x, y| (*x - *y).abs() < 0.5);
+            v
         })
         .collect();
-    let z = std::mem::take(&mut axes[2]);
-    let y = std::mem::take(&mut axes[1]);
-    let x = std::mem::take(&mut axes[0]);
-    let chain = |axis: usize, at: &[f64], child: &dyn Fn() -> Plan| {
-        if at.is_empty() {
+    let chain = |axis: usize, child: &dyn Fn() -> Plan| {
+        if at[axis].is_empty() {
             return child();
         }
-        let planes: Vec<Plane> = at.iter().map(|&v| Plane::axis(axis, v)).collect();
-        let children = (0..=at.len()).map(|_| child()).collect();
+        let planes: Vec<Plane> = at[axis].iter().map(|&v| Plane::axis(axis, v)).collect();
+        let children = (0..=planes.len()).map(|_| child()).collect();
         Plan::slabs(planes, children)
     };
-    chain(0, &x, &|| chain(1, &y, &|| chain(2, &z, &|| Plan::Leaf)))
+    chain(0, &|| chain(1, &|| chain(2, &|| Plan::Leaf)))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec3;
+
+    #[test]
+    fn even_cells_fit_and_user_cuts_are_kept() {
+        let bb = Aabb { min: Vec3::ZERO, max: Vec3::new(500.0, 200.0, 100.0) };
+        let mut s = Settings::default();
+        s.printer.volume = [210.0, 210.0, 210.0];
+        // 500 mm in cells of at most 200 mm: 3 cells, 2 cuts.
+        let c = cuts(&bb, &s);
+        assert_eq!(c[0].len(), 2);
+        assert!((c[0][0] - 166.67).abs() < 0.1, "{c:?}");
+        assert!(c[1].is_empty() && c[2].is_empty(), "{c:?}");
+        assert_eq!(plan(&bb, &c).leaf_count(), 3);
+        s.split.grid = Some([vec![300.0, 100.0], vec![50.0], vec![]]);
+        assert_eq!(cuts(&bb, &s)[0], vec![300.0, 100.0]);
+        assert_eq!(plan(&bb, &cuts(&bb, &s)).leaf_count(), 6);
+    }
+}

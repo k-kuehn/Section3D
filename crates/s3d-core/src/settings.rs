@@ -4,26 +4,53 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::printers::Printer;
-
+/// The printer: its build volume and the margin kept free around the bed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "PrinterFile")]
 pub struct PrinterSettings {
-    pub printer: Printer,
+    /// Build volume X, Y, Z (mm).
+    pub volume: [f32; 3],
     /// Clearance kept from each edge of the build volume (mm).
     pub margin: f32,
 }
 
 impl Default for PrinterSettings {
     fn default() -> Self {
-        PrinterSettings { printer: Printer::default(), margin: 5.0 }
+        PrinterSettings { volume: [256.0; 3], margin: 5.0 }
+    }
+}
+
+/// Stored form; older projects kept the volume in a named printer profile.
+#[derive(Deserialize)]
+#[serde(default)]
+struct PrinterFile {
+    volume: Option<[f32; 3]>,
+    margin: f32,
+    printer: Option<LegacyPrinter>,
+}
+
+#[derive(Deserialize)]
+struct LegacyPrinter {
+    volume: [f32; 3],
+}
+
+impl Default for PrinterFile {
+    fn default() -> Self {
+        PrinterFile { volume: None, margin: PrinterSettings::default().margin, printer: None }
+    }
+}
+
+impl From<PrinterFile> for PrinterSettings {
+    fn from(f: PrinterFile) -> Self {
+        let volume = f.volume.or(f.printer.map(|p| p.volume)).unwrap_or(PrinterSettings::default().volume);
+        PrinterSettings { volume, margin: f.margin }
     }
 }
 
 impl PrinterSettings {
     /// Usable build volume after margins (X, Y, Z).
     pub fn usable(&self) -> [f32; 3] {
-        let v = self.printer.volume;
+        let v = self.volume;
         [(v[0] - 2.0 * self.margin).max(10.0), (v[1] - 2.0 * self.margin).max(10.0), (v[2] - self.margin).max(10.0)]
     }
 }
@@ -48,7 +75,10 @@ impl Default for PrepareSettings {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SplitMode {
-    Triangle,
+    /// Broken-glass cells, then improved until every piece prints well.
+    #[serde(alias = "Triangle")]
+    Shatter,
+    /// Evenly spaced (or user-placed) planes along X, Y and Z, not optimised.
     Grid,
 }
 
@@ -62,15 +92,22 @@ pub struct SplitSettings {
     pub min_piece: f32,
     /// Overhang angle from vertical beyond which a surface needs support (degrees).
     pub overhang: f32,
-    /// Angle of the triangle side cuts from the base (degrees).
-    pub side_angle: f32,
-    /// Smart search time limit (seconds).
+    /// Narrowest a piece may get anywhere (mm).
+    pub min_thickness: f32,
+    /// Sharpest allowed corner between two cuts, or between a cut and the
+    /// surface (degrees).
+    pub min_angle: f32,
+    /// Longest the split may keep improving pieces (seconds); it stops
+    /// earlier once a round makes no progress.
     pub time_limit: f32,
+    /// Grid mode: cut positions along X, Y and Z (mm, model coordinates);
+    /// `None` spaces them evenly for the piece size.
+    pub grid: Option<[Vec<f32>; 3]>,
 }
 
 impl Default for SplitSettings {
     fn default() -> Self {
-        SplitSettings { mode: SplitMode::Triangle, target_size: None, min_piece: 15.0, overhang: 45.0, side_angle: 45.0, time_limit: 20.0 }
+        SplitSettings { mode: SplitMode::Shatter, target_size: None, min_piece: 15.0, overhang: 45.0, min_thickness: 10.0, min_angle: 25.0, time_limit: 180.0, grid: None }
     }
 }
 
@@ -79,6 +116,15 @@ pub enum LabelMode {
     Off,
     Emboss,
     Deboss,
+}
+
+/// Which side of a piece's skin carries its part number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LabelFace {
+    /// The outward-bulging side (outside of a shell).
+    Convex,
+    /// The hollow side (inside of a shell, hidden once assembled).
+    Concave,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -98,11 +144,13 @@ pub struct ConnectorSettings {
     pub label_size: f32,
     /// Emboss height / deboss depth (mm).
     pub label_depth: f32,
+    /// Preferred side for part numbers (pieces can be flipped one by one).
+    pub label_face: LabelFace,
 }
 
 impl Default for ConnectorSettings {
     fn default() -> Self {
-        ConnectorSettings { dowels: true, diameter: 6.0, clearance: 0.2, length: 30.0, per_cut: 2, labels: LabelMode::Deboss, label_size: 8.0, label_depth: 0.6 }
+        ConnectorSettings { dowels: true, diameter: 6.0, clearance: 0.2, length: 30.0, per_cut: 2, labels: LabelMode::Deboss, label_size: 8.0, label_depth: 0.6, label_face: LabelFace::Concave }
     }
 }
 

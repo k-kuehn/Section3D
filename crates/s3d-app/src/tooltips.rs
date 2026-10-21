@@ -1,5 +1,6 @@
 //! Help for every setting: a short explanation and a small vector diagram.
 
+use eframe::egui;
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Ui, Vec2, pos2, vec2};
 
 use crate::theme::{self, Palette};
@@ -12,7 +13,7 @@ pub struct Help {
 
 /// Every setting id used in the UI. A test checks each has help.
 pub const IDS: &[&str] = &[
-    "printer.model",
+    "printer.volume",
     "printer.margin",
     "prepare.rotate",
     "prepare.scale",
@@ -22,15 +23,18 @@ pub const IDS: &[&str] = &[
     "split.target_size",
     "split.min_piece",
     "split.overhang",
-    "split.side_angle",
+    "split.min_thickness",
+    "split.min_angle",
     "split.time_limit",
     "split.zones",
+    "split.grid",
     "conn.dowels",
     "conn.diameter",
     "conn.clearance",
     "conn.length",
     "conn.per_cut",
     "conn.labels",
+    "conn.label_face",
     "conn.label_size",
     "conn.label_depth",
     "export.folder",
@@ -49,35 +53,38 @@ pub const IDS: &[&str] = &[
 pub fn get(id: &str) -> Option<Help> {
     let h = |title, text, diagram| Some(Help { title, text, diagram });
     match id {
-        "printer.model" => h("Printer", "Pick your printer so every piece fits its build volume. Choose Custom to type your own size.", d_bed),
-        "printer.margin" => h("Bed margin", "Space kept free around the edge of the build plate. Pieces are sized to the bed minus this margin.", d_margin),
+        "printer.volume" => h("Printer", "Your printer's build volume (X × Y × Z). Every piece is sized to fit it, less the bed margin. Click to change it.", d_bed),
+        "printer.margin" => h("Bed margin", "Space kept free around the edge of the build plate (and below the top of the build height). Pieces are sized to the bed minus this margin.", d_margin),
         "prepare.rotate" => h("Rotate", "Turns the model around the X, Y and Z axes before splitting. Z points up.", d_rotate),
         "prepare.scale" => h("Scale", "Resizes the model uniformly. 100% keeps the original size in millimetres.", d_scale),
         "prepare.mirror" => h("Mirror", "Flips the model across the chosen axis.", d_mirror),
         "prepare.wall" => h("Wall thickness", "Hollow removes the inside of the model and leaves a shell this thick. Saves filament and print time.", d_wall),
-        "split.mode" => h("Split mode", "Triangle: big brick-like triangular pieces that print without supports (recommended). Grid: simple boxes the size of the bed.", d_mode),
-        "split.target_size" => h("Piece size", "Largest piece length. Leave on Max to use the biggest piece that fits your printer: fewer pieces, fewer seams.", d_target),
-        "split.min_piece" => h("Smallest piece", "Pieces thinner than this are merged into a neighbour so you never print tiny slivers.", d_sliver),
+        "split.mode" => h("Split mode", "Shatter: a broken-glass pattern; cuts meet the surface square, three pieces meet at each corner, and the pieces are then improved until they print without supports (may use more pieces). Grid: planes square to X, Y and Z, evenly spaced or where you put them; the pieces are checked and flagged, but the cuts are never moved.", d_mode),
+        "split.target_size" => h("Piece size", "Largest piece length. Max uses the biggest piece that fits your printer: fewer pieces, fewer seams. In Grid mode it sets the even spacing of the cuts.", d_target),
+        "split.min_piece" => h("Smallest piece", "Fragments whose longest side is under about 2.5 times this are merged into a neighbour (Shatter) or flagged SMALL (Grid).", d_sliver),
         "split.overhang" => h("Overhang limit", "Surfaces that lean further than this from vertical need support. 45° suits most printers.", d_overhang),
-        "split.side_angle" => h("Side angle", "Angle of the two side cuts of each triangle. 45° keeps pieces low and support-free.", d_side_angle),
-        "split.time_limit" => h("Search time", "How long Triangle mode keeps improving the layout. A first result appears within a couple of seconds.", d_time),
-        "split.zones" => h("No-cut zones", "Paint over details that must not be cut, like a face or lettering. Cuts move around painted areas.", d_zones),
-        "conn.dowels" => h("Dowel pins", "Adds matching blind holes on both sides of every cut. Glue dowel pins into them to align and strengthen joints.", d_dowel),
-        "conn.diameter" => h("Pin diameter", "Diameter of the dowel pins you will use.", d_diameter),
+        "split.min_thickness" => h("Thinnest part", "No piece may have a strip or tapering tip narrower than this. Shatter fixes them, Grid flags them THIN. Measured across the surface, so thin shell walls are fine.", d_thickness),
+        "split.min_angle" => h("Sharpest corner", "Corners where a cut meets another cut or an edge of the model, and edges where a cut meets the surface, must stay at least this blunt. Sharper ones are fragile points and feather edges (flagged SHARP).", d_min_angle),
+        "split.time_limit" => h("Max split time", "Shatter only: the longest the split keeps improving pieces. It stops earlier as soon as a round finds nothing better. The clock under the 3D view counts up towards it.", d_time),
+        "split.zones" => h("No-cut zones", "Paint over details that must not be cut, like a face or lettering. The paint shows on the surface like marker. Shatter keeps every cut out of it; in Grid mode pieces whose cuts run through it are flagged.", d_zones),
+        "split.grid" => h("Grid cuts", "How many cuts go along X, Y and Z, and where each one is (mm). Point at a value to highlight its plane on the model. A cell longer than the piece size is shown in orange. Reset spaces them evenly again.", d_mode),
+        "conn.dowels" => h("Dowel pins", "Drills matching blind holes on both sides of every cut. Glue dowel pins into them to align and strengthen joints. Pins are optional: you can also push parts together without them.", d_dowel),
+        "conn.diameter" => h("Pin diameter", "Diameter of the dowel pins you will use; type any size. A hole is skipped where the wall is too thin for it, and a smaller size that fits is suggested.", d_diameter),
         "conn.clearance" => h("Clearance", "Extra hole size so pins slide in. Increase if pins are too tight.", d_clearance),
         "conn.length" => h("Pin length", "Total pin length. Each side gets a hole half as deep, plus a little room for glue.", d_length),
-        "conn.per_cut" => h("Pins per cut", "How many pins each cut face gets. Holes are spread evenly and kept away from edges.", d_per_cut),
-        "conn.labels" => h("Part numbers", "Embosses (raised) or debosses (sunken) each piece's number on an outside face, never on a cut face.", d_label),
+        "conn.per_cut" => h("Pins per cut", "Most pins each cut face gets. Holes are kept away from edges, so small cut faces get fewer.", d_per_cut),
+        "conn.labels" => h("Part numbers", "Embosses (raised) or debosses (sunken) each piece's number on its own surface. A raised number that only fits on the face the piece prints on is sunk there instead; a piece with no room anywhere else gets its number sunk into a cut face. The numbers are drawn on the pieces in the 3D view.", d_label),
+        "conn.label_face" => h("Number face", "Convex puts numbers on the outside: facing away from the middle of the model and, of a wall's two sides, the one more open to view. Concave puts them on the inside, hidden once assembled. Where a side has no room the number is turned, then made smaller (down to half size, not under 3 mm), before it goes on the other side. Right-click a piece to move its number.", d_label),
         "conn.label_size" => h("Number size", "Height of the part number text.", d_label_size),
         "conn.label_depth" => h("Number depth", "How far the number is raised or sunk.", d_label_depth),
         "export.folder" => h("Destination", "Folder the print files are written to.", d_folder),
         "export.bed_name" => h("Bed file name", "Name for each bed's 3MF. Tokens: {project}, {bed}.", d_folder),
         "export.part_name" => h("Part file name", "Name for single-part STL files. Tokens: {project}, {part}.", d_folder),
-        "export.single_stls" => h("Single STLs", "Also write one STL file per piece.", d_folder),
-        "export.viewer" => h("3D viewer", "Writes an HTML file that shows the assembled model and every piece in any browser, offline.", d_viewer),
+        "export.single_stls" => h("Single STLs", "Also write one STL file per piece, in its print orientation.", d_folder),
+        "export.viewer" => h("3D viewer", "Writes one HTML file that shows the assembled model, an exploded view and every assembly step in any modern browser, offline.", d_viewer),
         "export.guide" => h("Assembly guide", "Writes a PDF with a parts checklist and one assembly step per page.", d_guide),
         "export.spacing" => h("Spacing", "Gap between pieces on the same bed.", d_spacing),
-        "export.keep_order" => h("Keep assembly order", "Fill beds in assembly order, so the first beds hold the first pieces you need.", d_order),
+        "export.keep_order" => h("Assembly order", "Ordered fills the beds in assembly order, so the first beds hold the pieces you join first. Random packs the pieces in whatever order fills the beds best.", d_order),
         "export.shrink_xy" => h("Shrinkage X/Y", "Enlarges exported parts horizontally to make up for material shrinkage.", d_shrink),
         "export.shrink_z" => h("Shrinkage Z", "Enlarges exported parts vertically to make up for material shrinkage.", d_shrink),
         "export.density" => h("Filament density", "Used to estimate each piece's weight. PLA ≈ 1.24 g/cm³, PETG ≈ 1.27.", d_weight),
@@ -195,17 +202,18 @@ fn d_wall(pt: &Painter, r: Rect, p: &Palette) {
 fn d_mode(pt: &Painter, r: Rect, p: &Palette) {
     let (f, s) = part(p);
     // Left: triangle bricks; right: grid.
-    let tri = |a: f32, up: bool| {
-        if up {
-            vec![(a, 0.85), (a + 0.2, 0.85), (a + 0.1, 0.45)]
-        } else {
-            vec![(a, 0.45), (a + 0.2, 0.45), (a + 0.1, 0.85)]
-        }
-    };
-    for (i, a) in [0.02, 0.12, 0.22].iter().enumerate() {
-        poly(pt, r, &tri(*a, i % 2 == 0), f, Stroke::new(1.0, p.accent));
+    // Left: broken-glass cells (three meet at each corner); right: grid.
+    let cells: [&[(f32, f32)]; 5] = [
+        &[(0.04, 0.4), (0.16, 0.36), (0.21, 0.55), (0.12, 0.66), (0.04, 0.62)],
+        &[(0.16, 0.36), (0.32, 0.4), (0.34, 0.56), (0.21, 0.55)],
+        &[(0.04, 0.62), (0.12, 0.66), (0.15, 0.86), (0.04, 0.86)],
+        &[(0.12, 0.66), (0.21, 0.55), (0.34, 0.56), (0.38, 0.72), (0.27, 0.86), (0.15, 0.86)],
+        &[(0.34, 0.56), (0.44, 0.6), (0.44, 0.86), (0.27, 0.86), (0.38, 0.72)],
+    ];
+    for c in cells {
+        poly(pt, r, c, f, Stroke::new(1.0, p.accent));
     }
-    text(pt, r, 0.22, 0.2, "Triangle", p.accent);
+    text(pt, r, 0.24, 0.2, "Shatter", p.accent);
     for i in 0..3 {
         for j in 0..2 {
             let (u, v) = (0.58 + i as f32 * 0.12, 0.45 + j as f32 * 0.2);
@@ -245,12 +253,25 @@ fn d_overhang(pt: &Painter, r: Rect, p: &Palette) {
     bed(pt, r, p);
 }
 
-fn d_side_angle(pt: &Painter, r: Rect, p: &Palette) {
+fn d_thickness(pt: &Painter, r: Rect, p: &Palette) {
     let (f, s) = part(p);
-    poly(pt, r, &[(0.1, 0.85), (0.9, 0.85), (0.5, 0.25)], f, s);
-    text(pt, r, 0.22, 0.75, "45°", p.accent);
-    text(pt, r, 0.78, 0.75, "45°", p.accent);
-    bed(pt, r, p);
+    poly(pt, r, &[(0.1, 0.25), (0.62, 0.25), (0.62, 0.8), (0.1, 0.8)], f, s);
+    poly(pt, r, &[(0.7, 0.25), (0.8, 0.25), (0.8, 0.8), (0.7, 0.8)], f, s);
+    dim(pt, r, (0.7, 0.9), (0.8, 0.9), "min", p);
+}
+
+fn d_min_angle(pt: &Painter, r: Rect, p: &Palette) {
+    let (f, s) = part(p);
+    poly(pt, r, &[(0.12, 0.8), (0.9, 0.8), (0.9, 0.3)], f, s);
+    let c = at(r, 0.12, 0.8);
+    pt.add(Shape::line(
+        (0..=10).map(|i| {
+            let a = -(i as f32 / 10.0) * 0.57;
+            c + Vec2::angled(a) * 46.0
+        }).collect(),
+        Stroke::new(1.5, p.accent),
+    ));
+    text(pt, r, 0.5, 0.88, "≥ min angle", p.accent);
 }
 
 fn d_time(pt: &Painter, r: Rect, p: &Palette) {

@@ -2,21 +2,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, channel};
-use std::time::Instant;
 
-use egui::{Color32, CornerRadius, RichText, Stroke, Ui, Vec2, pos2};
-use glam::{DVec3, Mat4, Vec3, Vec4};
+use eframe::egui;
+use egui::{Color32, CornerRadius, RichText, Stroke, Ui, Vec2};
+use glam::{Mat4, Vec3, Vec4};
 use s3d_core::assembly::Assembly;
 use s3d_core::bvh::Bvh;
-use s3d_core::edits::{EditOp, PieceRef, SeamRef};
-use s3d_core::job::JobCtx;
+use s3d_core::edits::EditOp;
 use s3d_core::mesh::{Aabb, Mesh};
 use s3d_core::pack::{Layout, PackItem, PackParams};
-use s3d_core::partition::{Orientation, Partition, PieceId, SeamId};
+use s3d_core::partition::{Partition, PieceId};
 use s3d_core::plane::Plane;
 use s3d_core::settings::fingerprint;
-use s3d_core::zones::Dab;
+use s3d_core::zones::{Dab, Zones};
 
 use crate::app::S3dApp;
 use crate::doc::{Document, Step};
@@ -33,43 +31,32 @@ pub enum Tab {
     Assembly,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PendingSeam {
-    pub seam: SeamId,
-    pub offset: f32,
-    pub tilt: f32,
-}
-
-pub struct Preview {
-    pub pending: PendingSeam,
-    pub pieces: Vec<(Arc<Mesh>, Option<Orientation>, u64)>,
-    pub replaced: Vec<PieceId>,
-    pub support: f32,
-}
-
-#[derive(Clone, Copy)]
-enum HandleKind {
-    Move,
-    Tilt,
-}
-
-#[derive(Clone, Copy)]
-struct HandleDrag {
-    seam: SeamId,
-    kind: HandleKind,
-    start: PendingSeam,
-    accum: Vec2,
+/// A cut line being drawn across one piece (points and surface normals in
+/// the piece's own coordinates).
+#[derive(Clone, Debug, Default)]
+pub struct CutDraw {
+    pub piece: PieceId,
+    pub pts: Vec<Vec3>,
+    pub normals: Vec<Vec3>,
 }
 
 pub struct ViewState {
     pub viewport: Viewport,
     pub tab: Tab,
+    /// The selected piece (the one shown in the properties card).
     pub selected: Option<PieceId>,
+    /// Further pieces added to the selection with Shift-click.
+    pub multi: Vec<PieceId>,
     pub hover: Option<PieceId>,
-    pub hover_seam: Option<SeamId>,
     pub hidden: HashSet<PieceId>,
     pub isolate: Option<Vec<PieceId>>,
     pub show_planes: bool,
+    /// Draw the part numbers on the pieces.
+    pub show_numbers: bool,
+    /// The parts list shows only pieces that need attention, worst first.
+    pub attention: bool,
+    /// Grid cut (axis, index) under the pointer in the Split card.
+    pub grid_hover: Option<(usize, usize)>,
     pub section: bool,
     pub section_axis: usize,
     pub section_pos: f32,
@@ -77,28 +64,36 @@ pub struct ViewState {
     measure_pts: Vec<Vec3>,
     pub explode: f32,
     pub assembly_step: usize,
+    /// Assembly view also shows the rest of the model, faintly.
+    pub assembly_context: bool,
+    /// Step the assembly camera was last framed on.
+    assembly_framed: Option<usize>,
     pub paint: bool,
     pub brush: f32,
     pub erase: bool,
-    pub pending: Option<PendingSeam>,
-    pub preview: Option<Preview>,
-    preview_rx: Option<(PendingSeam, JobCtx, Receiver<Preview>)>,
-    preview_due: Option<(PendingSeam, Instant)>,
+    /// Cut line being drawn, if the tool is active.
+    pub cut_draw: Option<CutDraw>,
     pub beds: Layout,
     pub beds_key: Option<u64>,
+    /// Beds tab shows the plates in 3D (else a flat plan for dragging).
+    pub beds_3d: bool,
+    pub beds_viewport: Viewport,
     pub arrange_needed: bool,
     /// Set when arranging failed, so it is not retried every frame.
     pub arrange_failed: bool,
     bvh: HashMap<u64, Arc<std::sync::OnceLock<Arc<Bvh>>>>,
     assembly: Option<(u64, Arc<Assembly>)>,
-    drag: Option<HandleDrag>,
-    bed_drag: Option<(PieceId, egui::Vec2)>,
-    footprints: HashMap<u64, Arc<Vec<glam::Vec2>>>,
+    pub(crate) bed_drag: Option<(PieceId, egui::Vec2)>,
+    pub(crate) footprints: HashMap<u64, Arc<Vec<glam::Vec2>>>,
+    /// Part number outlines per piece mesh.
+    label_lines: HashMap<u64, Arc<Vec<[Vec3; 2]>>>,
+    /// Sharp edges per piece mesh, outlined on selected pieces.
+    edge_lines: HashMap<u64, Arc<Vec<[Vec3; 2]>>>,
+    /// Painted-zone overlay triangles and what they were built from.
+    paint_tris: Option<(u64, Arc<Vec<TriVert>>)>,
     fitted_once: bool,
-    /// Cut lines and summary of the Triangle search's current best layout.
+    /// Cut lines and summary of the split's current best layout.
     pub search_preview: Arc<std::sync::Mutex<Option<(Arc<Vec<[Vec3; 2]>>, String)>>>,
-    /// Handle screen positions from the last frame, for hit testing.
-    handle_screen_positions: std::cell::RefCell<Vec<(SeamId, egui::Pos2, HandleKindTag, Vec3)>>,
 }
 
 impl Default for ViewState {
@@ -107,11 +102,14 @@ impl Default for ViewState {
             viewport: Viewport::default(),
             tab: Tab::Model,
             selected: None,
+            multi: Vec::new(),
             hover: None,
-            hover_seam: None,
             hidden: HashSet::new(),
             isolate: None,
             show_planes: false,
+            show_numbers: true,
+            attention: false,
+            grid_hover: None,
             section: false,
             section_axis: 0,
             section_pos: 0.5,
@@ -119,24 +117,26 @@ impl Default for ViewState {
             measure_pts: Vec::new(),
             explode: 0.0,
             assembly_step: 0,
+            assembly_context: true,
+            assembly_framed: None,
             paint: false,
             brush: 20.0,
             erase: false,
-            pending: None,
-            preview: None,
-            preview_rx: None,
-            preview_due: None,
+            cut_draw: None,
             beds: Layout::default(),
             beds_key: None,
+            beds_3d: true,
+            beds_viewport: Viewport::default(),
             arrange_needed: false,
             arrange_failed: false,
             bvh: HashMap::new(),
             assembly: None,
-            drag: None,
             bed_drag: None,
             footprints: HashMap::new(),
+            label_lines: HashMap::new(),
+            edge_lines: HashMap::new(),
+            paint_tris: None,
             fitted_once: false,
-            handle_screen_positions: Default::default(),
             search_preview: Default::default(),
         }
     }
@@ -165,11 +165,46 @@ pub fn arrange_key(doc: &Document) -> u64 {
 }
 
 impl ViewState {
+    /// Selects one piece (or none), dropping any multi-selection.
     pub fn select(&mut self, id: Option<PieceId>) {
-        if self.selected != id {
-            self.clear_pending();
-        }
         self.selected = id;
+        self.multi.clear();
+        if self.cut_draw.as_ref().is_some_and(|c| Some(c.piece) != id) {
+            self.cut_draw = None;
+        }
+    }
+
+    /// Shift-click: adds a piece to the selection, or takes it out.
+    pub fn toggle_select(&mut self, id: PieceId) {
+        self.cut_draw = None;
+        match self.selected {
+            None => self.selected = Some(id),
+            Some(s) if s == id => self.selected = self.multi.pop(),
+            Some(_) => {
+                if let Some(i) = self.multi.iter().position(|m| *m == id) {
+                    self.multi.remove(i);
+                } else {
+                    self.multi.push(id);
+                }
+            }
+        }
+    }
+
+    /// Every selected piece, the main one first.
+    pub fn selection(&self) -> Vec<PieceId> {
+        self.selected.into_iter().chain(self.multi.iter().copied()).collect()
+    }
+
+    pub fn is_selected(&self, id: PieceId) -> bool {
+        self.selected == Some(id) || self.multi.contains(&id)
+    }
+
+    /// Drops selected pieces that no longer exist.
+    pub fn prune_selection(&mut self, part: &Partition) {
+        self.multi.retain(|id| part.piece(*id).is_some());
+        if self.selected.is_some_and(|id| part.piece(id).is_none()) {
+            self.selected = self.multi.pop();
+        }
     }
 
     pub fn is_hidden(&self, id: PieceId) -> bool {
@@ -189,42 +224,26 @@ impl ViewState {
 
     pub fn on_new_split(&mut self) {
         self.footprints.clear();
-        self.selected = None;
+        self.label_lines.clear();
+        self.select(None);
         self.hidden.clear();
         self.isolate = None;
-        self.clear_pending();
+        self.cut_draw = None;
         self.assembly = None;
         self.measure_pts.clear();
     }
 
-    pub fn on_pieces_changed(&mut self, _changed: &[PieceId]) {
-        self.clear_pending();
+    pub fn on_pieces_changed(&mut self) {
+        self.cut_draw = None;
         self.assembly = None;
     }
 
-    pub fn set_pending(&mut self, pd: PendingSeam) {
-        if pd.offset.abs() < 1e-4 && pd.tilt.abs() < 1e-4 {
-            self.clear_pending();
-            return;
-        }
-        self.pending = Some(pd);
-        self.preview_due = Some((pd, Instant::now()));
-    }
-
-    pub fn clear_pending(&mut self) {
-        self.pending = None;
-        self.preview = None;
-        self.preview_due = None;
-        if let Some((_, ctx, _)) = self.preview_rx.take() {
-            ctx.cancel();
-        }
-    }
-
-    /// The adjusted plane for the pending seam edit.
-    pub fn pending_plane(&self, part: &Partition) -> Option<Plane> {
-        let pd = self.pending?;
-        let s = part.seam(pd.seam)?;
-        Some(adjusted_plane(&s.plane, s.center, pd.offset, pd.tilt))
+    /// Starts drawing a cut line across a piece.
+    pub fn start_cut_draw(&mut self, id: PieceId) {
+        self.select(Some(id));
+        self.paint = false;
+        self.measure = false;
+        self.cut_draw = Some(CutDraw { piece: id, ..Default::default() });
     }
 
     /// True when the bed layout is missing or no longer matches the pieces.
@@ -281,85 +300,141 @@ impl ViewState {
         self.assembly.as_ref().map(|a| a.1.clone())
     }
 
-    fn poll_preview(&mut self, doc: &Document, ctx: &egui::Context) {
-        if let Some((pd, _, rx)) = &self.preview_rx {
-            if let Ok(p) = rx.try_recv() {
-                if Some(*pd) == self.pending {
-                    self.preview = Some(p);
-                }
-                self.preview_rx = None;
+    /// Outline segments of a piece's part number (cached per mesh).
+    fn label_outline(&mut self, mesh_id: u64, place: &s3d_core::labels::LabelPlace) -> Arc<Vec<[Vec3; 2]>> {
+        self.label_lines.entry(mesh_id).or_insert_with(|| Arc::new(s3d_core::labels::outline(place))).clone()
+    }
+
+    /// Edges of a selected piece, drawn over it in the accent colour.
+    pub(crate) fn outline_edges(&mut self, mesh_id: u64, mesh: &Mesh, model: Mat4, color: [f32; 4], width: f32, out: &mut Vec<LineSeg>) {
+        let e = self.edge_lines.entry(mesh_id).or_insert_with(|| Arc::new(mesh.feature_edges(30.0)));
+        out.extend(e.iter().map(|s| LineSeg::new(model.transform_point3(s[0]), model.transform_point3(s[1]), color, width)));
+    }
+}
+
+/// Painted zones as surface triangles of the drawn meshes, slightly lifted
+/// and shaded, so the paint looks like marker on the model. `to_local` maps
+/// a dab (source coordinates) into the drawn meshes' own coordinates.
+fn paint_overlay(zones: &Zones, drawn: &[(Arc<Bvh>, Mat4)], to_local: Mat4, color: [f32; 3]) -> Vec<TriVert> {
+    let scale = to_local.to_scale_rotation_translation().0.abs().max_element().max(1e-6);
+    let light = Vec3::new(0.35, 0.25, 0.9).normalize();
+    let mut out = Vec::new();
+    let dabs: Vec<Dab> = zones.dabs.iter().map(|d| Dab { p: to_local.transform_point3(d.p), radius: d.radius * scale, n: to_local.transform_vector3(d.n).normalize_or_zero() }).collect();
+    for (bvh, model) in drawn {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut push = |t: &[Vec3; 3]| {
+            let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
+            let lift = n * 0.12;
+            let k = 0.6 + 0.4 * model.transform_vector3(n).normalize_or_zero().dot(light).abs();
+            let c = [color[0] * k, color[1] * k, color[2] * k, 1.0];
+            for v in t {
+                out.push(TriVert { pos: model.transform_point3(*v + lift).into(), color: c });
             }
-        }
-        if let Some((pd, at)) = self.preview_due {
-            if at.elapsed().as_millis() < 250 || self.drag.is_some() {
-                ctx.request_repaint_after(std::time::Duration::from_millis(60));
-                return;
-            }
-            self.preview_due = None;
-            let (Some(split), Some(plane)) = (doc.split.clone(), doc.split.as_ref().and_then(|s| self.pending_plane(&s.partition))) else { return };
-            let Some(seam) = SeamRef::of(&split.partition, pd.seam) else { return };
-            let settings = doc.settings.clone();
-            let job = JobCtx::new();
-            let (tx, rx) = channel();
-            let jc = job.clone();
-            let repaint = ctx.clone();
-            let generation = split.generation;
-            std::thread::spawn(move || {
-                let mut part = split.partition.clone();
-                let s = part.seam(pd.seam).cloned();
-                let (st, changed) = s3d_core::edits::apply(&mut part, &EditOp::MoveSeam { seam, plane });
-                if jc.is_cancelled() || st != s3d_core::edits::EditStatus::Applied {
+        };
+        for d in &dabs {
+            bvh.for_each_near(d.p, d.radius, |u| {
+                let t = bvh.triangle(u);
+                if !d.covers(&t) {
                     return;
                 }
-                let params = s3d_core::split::orient_params(&settings);
-                s3d_core::split::orient_pieces(&mut part, &changed, &params);
-                let pieces: Vec<(Arc<Mesh>, Option<Orientation>, u64)> =
-                    changed.iter().filter_map(|id| part.piece(*id)).map(|p| (p.mesh.clone(), p.orient, (generation << 32) ^ 0x8000_0000 ^ p.rev)).collect();
-                let support = pieces.iter().filter_map(|p| p.1.map(|o| o.support_area)).fold(0.0, f32::max);
-                let replaced = s.map(|s| vec![s.a, s.b]).unwrap_or_default();
-                let _ = tx.send(Preview { pending: pd, pieces, replaced, support });
-                repaint.request_repaint();
+                let long = (0..3).map(|i| t[i].distance(t[(i + 1) % 3])).fold(0.0f32, f32::max);
+                if long <= d.radius * 0.35 {
+                    // Small triangle: whole, once, if its middle is painted.
+                    if (t[0] + t[1] + t[2]).distance(d.p * 3.0) <= d.radius * 3.0 && seen.insert(u) {
+                        push(&t);
+                    }
+                    return;
+                }
+                // Big triangle: only the painted part of a subdivision.
+                let mut stack = vec![(t, 0)];
+                while let Some((s, depth)) = stack.pop() {
+                    let long = (0..3).map(|i| s[i].distance(s[(i + 1) % 3])).fold(0.0f32, f32::max);
+                    let mid = (s[0] + s[1] + s[2]) / 3.0;
+                    if long <= d.radius * 0.35 || depth >= 5 {
+                        if mid.distance(d.p) <= d.radius {
+                            push(&s);
+                        }
+                        continue;
+                    }
+                    if s3d_core::bvh::closest_on_tri(d.p, &s).distance(d.p) > d.radius {
+                        continue;
+                    }
+                    let (a, b, c) = ((s[0] + s[1]) * 0.5, (s[1] + s[2]) * 0.5, (s[2] + s[0]) * 0.5);
+                    for q in [[s[0], a, c], [a, s[1], b], [c, b, s[2]], [a, b, c]] {
+                        stack.push((q, depth + 1));
+                    }
+                }
             });
-            if let Some((_, old, _)) = self.preview_rx.replace((pd, job, rx)) {
-                old.cancel();
-            }
         }
     }
-}
-
-/// Moves a plane along its normal and tilts it about its most horizontal
-/// in-plane axis through the seam centre.
-pub fn adjusted_plane(base: &Plane, center: Vec3, offset: f32, tilt_deg: f32) -> Plane {
-    let moved = base.moved(offset as f64);
-    if tilt_deg.abs() < 1e-6 {
-        return moved;
-    }
-    let pivot = moved.project(center.as_dvec3());
-    moved.tilted(pivot, tilt_axis(&moved), (tilt_deg as f64).to_radians())
-}
-
-pub fn tilt_axis(pl: &Plane) -> DVec3 {
-    let a = pl.normal.cross(DVec3::Z);
-    if a.length() > 0.2 { a.normalize() } else { pl.normal.cross(DVec3::X).normalize() }
+    out
 }
 
 // ---------------------------------------------------------------------------
 
 pub fn show(app: &mut S3dApp, ui: &mut Ui) {
     let p = app.palette();
-    app.view.poll_preview(&app.doc, ui.ctx());
+    // One projection choice for every 3D view.
+    app.view.viewport.camera.ortho = app.recent.ortho;
+    app.view.beds_viewport.camera.ortho = app.recent.ortho;
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        app.view.cut_draw = None;
+    }
     egui::Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.card_stroke)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         tabs_row(app, ui, &p);
         ui.add_space(2.0);
-        match app.view.tab {
+        // A running job gets a progress strip under the view.
+        let busy = app.jobs.current.is_some();
+        let full = ui.available_rect_before_wrap();
+        let main = if busy { full.with_max_y(full.max.y - 40.0) } else { full };
+        ui.scope_builder(egui::UiBuilder::new().max_rect(main), |ui| match app.view.tab {
             Tab::Model | Tab::Assembly => {
                 toolbar(app, ui, &p);
                 viewport(app, ui, &p);
             }
-            Tab::Beds => beds_view(app, ui, &p),
+            Tab::Beds => crate::beds::beds_view(app, ui, &p),
+        });
+        if busy {
+            let strip = full.with_min_y(main.max.y);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(strip.shrink2(Vec2::new(12.0, 6.0))), |ui| progress_strip(app, ui, &p));
         }
     });
+}
+
+/// Stage, a clock counting up (with the split's time limit beside it) and
+/// Cancel for the running job.
+fn progress_strip(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
+    let Some(r) = &app.jobs.current else { return };
+    let (kind, stage, secs) = (r.kind, r.ctx.stage(), r.started.elapsed().as_secs_f32());
+    // Only Shatter keeps improving pieces up to the time limit.
+    let shatter = app.doc.settings.split.mode == s3d_core::settings::SplitMode::Shatter;
+    let limit = (kind == crate::jobs::JobKind::Split && shatter).then_some(app.doc.settings.split.time_limit);
+    let mut cancel = false;
+    ui.horizontal_centered(|ui| {
+        ui.add(egui::Spinner::new().size(14.0).color(p.accent));
+        widgets::right(ui, |ui| {
+            cancel = ui.button("Cancel").clicked();
+            ui.add_space(6.0);
+            if let Some(l) = limit {
+                ui.label(RichText::new(format!("/ {} limit", clock(l))).color(p.text_weak).monospace());
+            }
+            ui.label(RichText::new(clock(secs)).font(egui::FontId::monospace(15.0)).color(p.text_strong));
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(format!("{} — {stage}", kind.label())).color(p.text)).truncate());
+            });
+        });
+    });
+    if cancel {
+        app.jobs.cancel();
+        app.notice = Some(crate::app::Notice::Info("Cancelled.".into()));
+    }
+}
+
+/// Minutes and seconds, as 0:42.
+fn clock(secs: f32) -> String {
+    let s = secs.floor() as u32;
+    format!("{}:{:02}", s / 60, s % 60)
 }
 
 fn tabs_row(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
@@ -396,13 +471,27 @@ fn tabs_row(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     ui.painter().hline(r.x_range(), ui.cursor().top(), Stroke::new(1.0, p.card_stroke));
 }
 
+/// Perspective / isometric switch (shared by all 3D views, remembered).
+pub fn projection_switch(app: &mut S3dApp, ui: &mut Ui) {
+    let mut ortho = app.recent.ortho;
+    // Laid out left to right even inside right-aligned toolbars.
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        widgets::segmented(ui, &mut ortho, &[(false, "Perspective"), (true, "Isometric")]).on_hover_text("Perspective view, or a parallel (isometric) projection without perspective");
+    });
+    if ortho != app.recent.ortho {
+        app.recent.ortho = ortho;
+        app.recent.save();
+    }
+}
+
 fn toolbar(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
         ui.spacing_mut().item_spacing.x = 6.0;
         let is_assembly = app.view.tab == Tab::Assembly;
         let has_split = app.doc.split.is_some();
-        let n = app.doc.split.as_ref().map(|s| s.partition.pieces.len()).unwrap_or(0);
+        // Assembly: one position per joining step, plus the finished model.
+        let n = if is_assembly { app.view.assembly(&app.doc).map(|a| a.steps.len() + 1).unwrap_or(1) } else { 0 };
         let v = &mut app.view;
         if is_assembly {
             ui.label(widgets::weak(ui, "Step"));
@@ -416,9 +505,11 @@ fn toolbar(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
             if ui.small_button("▶").clicked() {
                 v.assembly_step = (v.assembly_step + 1).min(n.saturating_sub(1));
             }
+            widgets::toggle_button(ui, &mut v.assembly_context, "Context").on_hover_text("Also show the rest of the model, faintly");
         } else {
             ui.add_enabled_ui(has_split, |ui| {
                 widgets::toggle_button(ui, &mut v.show_planes, "Cut planes").on_hover_text("Show the cut planes faintly");
+                widgets::toggle_button(ui, &mut v.show_numbers, "Numbers").on_hover_text("Show the embossed or debossed part numbers");
                 ui.label(widgets::weak(ui, "Explode"));
                 ui.add(egui::Slider::new(&mut v.explode, 0.0..=1.0).show_value(false));
             });
@@ -454,6 +545,8 @@ fn toolbar(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
                     }
                 }
             });
+            ui.add_space(8.0);
+            projection_switch(app, ui);
         });
     });
     ui.add_space(2.0);
@@ -471,9 +564,23 @@ fn explode_offset(c: Vec3, center: Vec3, f: f32) -> Vec3 {
     (c - center) * f * 0.6
 }
 
-fn rgba(c: Color32, a: f32) -> [f32; 4] {
+pub fn rgba(c: Color32, a: f32) -> [f32; 4] {
     [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, a]
 }
+
+/// The camera's screen-up direction in world space.
+/// Slow pulse between 0 and 1 (period 1.8 s) for highlighting.
+pub fn pulse(time: f64) -> f32 {
+    (0.5 - 0.5 * (time * std::f64::consts::TAU / 1.8).cos()) as f32
+}
+
+fn cam_up(cam: &crate::viewport::Camera) -> Vec3 {
+    let v = cam.view();
+    Vec3::new(v.x_axis.y, v.y_axis.y, v.z_axis.y)
+}
+
+/// Colour of painted no-cut zones (like a marker on the surface).
+const PAINT: [f32; 3] = [0.62, 0.28, 0.95];
 
 fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     let mut frame = SceneFrame {
@@ -483,41 +590,54 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
         bg: p.viewport_bg,
         ..Default::default()
     };
-    let show_pieces = app.doc.split.is_some() && (matches!(app.step, Step::Split | Step::Connectors | Step::Export) || app.view.tab == Tab::Assembly);
+    let show_pieces = app.doc.split.is_some() && (matches!(app.step, Step::Split | Step::Features | Step::Export) || app.view.tab == Tab::Assembly);
     let mut drawn: Vec<Drawn> = Vec::new();
     let mut scene_bb = Aabb::EMPTY;
     let prepared_xf = app.doc.placement().unwrap_or(Mat4::IDENTITY);
     // Pick hits are converted to source coordinates for no-cut zones: the
     // unsplit, unhollowed model is drawn as the source mesh itself.
     let mut local_is_source = false;
+    if let Some(split) = app.doc.split.clone() {
+        app.view.prune_selection(&split.partition);
+    }
 
     if let Some(split) = app.doc.split.clone().filter(|_| show_pieces) {
         let part = &split.partition;
         let center = part.pieces.iter().fold(Aabb::EMPTY, |b, q| b.union(&q.bbox)).center();
         let assembly = if app.view.tab == Tab::Assembly { app.view.assembly(&app.doc) } else { None };
-        let preview_replaced: Vec<PieceId> = app.view.preview.as_ref().filter(|pv| Some(pv.pending) == app.view.pending).map(|pv| pv.replaced.clone()).unwrap_or_default();
+        // Current step: the two parts being joined, in place, the one being
+        // added highlighted; everything else faint for context.
+        let step = assembly.as_ref().and_then(|a| a.steps.get(app.view.assembly_step.min(a.steps.len())).cloned());
+        let numbers = app.view.show_numbers && app.view.tab == Tab::Model;
+        // The joining part's outline pulses slowly in the assembly view.
+        let outline = if assembly.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            let k = pulse(ui.input(|i| i.time));
+            (rgba(p.accent, 0.3 + 0.7 * k), 1.5 + 2.0 * k)
+        } else {
+            (rgba(p.accent, 1.0), 2.0)
+        };
+        let ink = if p.dark { [0.06, 0.07, 0.09, 0.95] } else { [0.10, 0.11, 0.14, 0.95] };
         for q in &part.pieces {
             frame.meshes.push(MeshRef { id: split.mesh_id(q.rev), rev: q.rev, mesh: q.display_mesh().clone() });
         }
         for q in &part.pieces {
             let mut model = Mat4::IDENTITY;
             let mut flags = FLAG_SUPPORT;
-            let mut color = piece_color(q.label, p.dark);
+            let color = piece_color(q.label, p.dark);
             let mut alpha = 1.0;
-            if let Some(a) = &assembly {
-                let idx = a.order.iter().position(|x| *x == q.id).unwrap_or(0);
-                let step = app.view.assembly_step.min(a.order.len().saturating_sub(1));
-                if idx > step {
-                    continue;
-                }
+            if assembly.is_some() {
                 flags = 0;
-                if idx == step {
-                    // Current piece: lifted back along its insertion path.
-                    let dir = a.insert_dir.get(&q.id).copied().unwrap_or(-Vec3::Z);
-                    model = Mat4::from_translation(-dir * q.bbox.size().max_element() * 0.35);
-                    flags |= FLAG_SELECTED;
-                } else {
-                    color = [color[0] * 0.75, color[1] * 0.75, color[2] * 0.75];
+                if let Some(st) = &step {
+                    if st.b.contains(&q.id) {
+                        flags |= FLAG_SELECTED;
+                    } else if !st.a.contains(&q.id) {
+                        if !app.view.assembly_context {
+                            continue;
+                        }
+                        flags |= FLAG_GHOST;
+                        alpha = 0.08;
+                    }
                 }
             } else {
                 if app.view.is_hidden(q.id) {
@@ -526,17 +646,13 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
                 if app.view.explode > 0.0 {
                     model = Mat4::from_translation(explode_offset(q.centroid, center, app.view.explode));
                 }
-                if app.view.selected == Some(q.id) {
+                if app.view.is_selected(q.id) {
                     flags |= FLAG_SELECTED;
                 } else if app.view.hover == Some(q.id) {
                     flags |= FLAG_HOVER;
                 }
-                if preview_replaced.contains(&q.id) {
-                    flags |= FLAG_GHOST;
-                    alpha = 0.25;
-                }
             }
-            let planes: Vec<Vec4> = if app.view.selected == Some(q.id) { part.seams_of(q.id).map(|s| s.plane.as_vec4()).collect() } else { Vec::new() };
+            let planes: Vec<Vec4> = if app.view.selected == Some(q.id) && app.view.multi.is_empty() { part.seams_of(q.id).map(|s| s.plane.as_vec4()).collect() } else { Vec::new() };
             let mesh_id = split.mesh_id(q.rev);
             frame.items.push(DrawItem {
                 mesh: mesh_id,
@@ -547,6 +663,26 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
                 flags,
                 planes,
             });
+            if flags & FLAG_SELECTED != 0 {
+                app.view.outline_edges(mesh_id, q.display_mesh(), model, outline.0, outline.1, &mut frame.lines);
+            }
+            if numbers && q.finished.is_some() {
+                // Only numbers big enough on screen to read (tiny ones would
+                // just be dark specks).
+                let cam = &app.view.viewport.camera;
+                let (aspect, h) = (app.view.viewport.aspect(), app.view.viewport.size().y);
+                let readable = q.label_place.as_ref().is_some_and(|l| {
+                    let c = model.transform_point3(l.center);
+                    match (cam.project(c, aspect), cam.project(c + cam_up(cam) * l.size, aspect)) {
+                        (Some(a), Some(b)) => (a - b).length() * 0.5 * h >= 7.0,
+                        _ => false,
+                    }
+                });
+                if let Some(place) = q.label_place.as_ref().filter(|_| readable) {
+                    let segs = app.view.label_outline(mesh_id, place);
+                    frame.lines.extend(segs.iter().map(|s| LineSeg::new(model.transform_point3(s[0]), model.transform_point3(s[1]), ink, 1.6)));
+                }
+            }
             let mut bb = q.bbox;
             let t = model.w_axis.truncate();
             bb.min += t;
@@ -554,14 +690,9 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
             scene_bb = scene_bb.union(&bb);
             drawn.push(Drawn { id: q.id, mesh_id, mesh: q.display_mesh().clone(), model });
         }
-        // Seam adjustment preview.
-        if let Some(pv) = app.view.preview.as_ref().filter(|pv| Some(pv.pending) == app.view.pending) {
-            for (i, (m, o, id)) in pv.pieces.iter().enumerate() {
-                frame.meshes.push(MeshRef { id: *id, rev: *id, mesh: m.clone() });
-                let c = if i % 2 == 0 { [0.95, 0.75, 0.55] } else { [0.6, 0.78, 0.95] };
-                frame.items.push(DrawItem { mesh: *id, model: Mat4::IDENTITY, print: o.map(|o| o.matrix()).unwrap_or(Mat4::IDENTITY), color: [c[0], c[1], c[2], 1.0], highlight: [0.0; 4], flags: FLAG_SUPPORT, planes: vec![] });
-            }
-        }
+        let live: HashSet<u64> = drawn.iter().map(|d| d.mesh_id).collect();
+        app.view.label_lines.retain(|k, _| live.contains(k));
+        app.view.edge_lines.retain(|k, _| live.contains(k));
         if app.view.show_planes && app.view.tab == Tab::Model {
             for s in &part.seams {
                 plane_quad(&mut frame, s.plane, s.center, (s.area.sqrt() as f32).max(10.0), [p.accent.r() as f32 / 255.0, p.accent.g() as f32 / 255.0, p.accent.b() as f32 / 255.0, 0.10]);
@@ -576,7 +707,39 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
         drawn.push(Drawn { id: u32::MAX, mesh_id: id, mesh, model });
     }
 
-    // Triangle search in progress: draw the current best layout's cut lines.
+    // Grid mode, before (re)splitting: the cut planes on the model.
+    let grid_preview = app.step == Step::Split && app.view.tab == Tab::Model && app.doc.settings.split.mode == s3d_core::settings::SplitMode::Grid && (app.doc.split.is_none() || app.status(Step::Split) == crate::doc::Status::Stale);
+    if grid_preview && !app.jobs.busy() {
+        if let Some((mesh, _)) = app.doc.prepared_mesh() {
+            let bb = mesh.bbox();
+            let cuts = s3d_core::split::grid::cuts(&bb, &app.doc.settings);
+            let pad = bb.size() * 0.04;
+            for (a, list) in cuts.iter().enumerate() {
+                for (i, &v) in list.iter().enumerate() {
+                    let hot = app.view.grid_hover == Some((a, i));
+                    let (u, w) = ((a + 1) % 3, (a + 2) % 3);
+                    let corner = |su: f32, sw: f32| {
+                        let mut c = Vec3::ZERO;
+                        c[a] = v;
+                        c[u] = if su < 0.0 { bb.min[u] - pad[u] } else { bb.max[u] + pad[u] };
+                        c[w] = if sw < 0.0 { bb.min[w] - pad[w] } else { bb.max[w] + pad[w] };
+                        c
+                    };
+                    let q = [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)];
+                    let fill = rgba(p.accent, if hot { 0.32 } else { 0.10 });
+                    for t in [[0, 1, 2], [0, 2, 3]] {
+                        frame.tris.extend(t.map(|k| TriVert { pos: q[k].into(), color: fill }));
+                    }
+                    let edge = rgba(p.accent, if hot { 1.0 } else { 0.6 });
+                    for k in 0..4 {
+                        frame.overlay_lines.push(LineSeg::new(q[k], q[(k + 1) % 4], edge, if hot { 2.5 } else { 1.2 }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Split in progress: draw the current best layout's cut lines.
     let searching = app.jobs.current.as_ref().is_some_and(|r| r.kind == crate::jobs::JobKind::Split);
     if searching && !show_pieces {
         if let Some((edges, _)) = app.view.search_preview.lock().unwrap().clone() {
@@ -588,7 +751,25 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
         scene_bb = Aabb { min: Vec3::splat(-100.0), max: Vec3::splat(100.0) };
     }
     let printer_bb = ground_and_printer(&mut frame, &scene_bb, &app.doc, p);
-    let fit_bb = scene_bb.union(&printer_bb);
+    let mut fit_bb = scene_bb.union(&printer_bb);
+    // Assembly: frame the parts of the current step whenever it changes.
+    if app.view.tab == Tab::Assembly {
+        if let (Some(a), Some(split)) = (app.view.assembly(&app.doc), app.doc.split.clone()) {
+            let k = app.view.assembly_step.min(a.steps.len());
+            if app.view.assembly_framed != Some(k) {
+                app.view.assembly_framed = Some(k);
+                if let Some(st) = a.steps.get(k) {
+                    let bb = st.a.iter().chain(&st.b).filter_map(|id| split.partition.piece(*id)).fold(Aabb::EMPTY, |b, q| b.union(&q.bbox));
+                    if !bb.is_empty() {
+                        fit_bb = Aabb { min: bb.min, max: bb.max + Vec3::splat(bb.size().max_element() * 0.15) };
+                    }
+                } else {
+                    fit_bb = scene_bb;
+                }
+                app.view.viewport.pending_fit = true;
+            }
+        }
+    }
 
     // Section plane.
     if app.view.section && app.view.tab == Tab::Model {
@@ -600,14 +781,31 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     }
 
     // Interaction.
-    let tool_drag = app.view.paint || app.view.drag.is_some() || handle_under_pointer(app, ui);
+    let painting = app.view.paint && app.step == Step::Split && app.view.tab == Tab::Model;
+    let drawing_cut = app.view.cut_draw.is_some() && app.view.tab == Tab::Model && show_pieces;
+    let tool_drag = painting || drawing_cut;
     // Picking structures are only needed (and built) while the pointer is
-    // over the viewport; caches keep only meshes drawn now.
+    // over the viewport or paint must be shown; caches keep only meshes
+    // drawn now.
     let ctx = ui.ctx().clone();
     let live: HashSet<u64> = drawn.iter().map(|d| d.mesh_id).collect();
     app.view.bvh.retain(|k, _| live.contains(k));
-    let over = ctx.pointer_hover_pos().is_some_and(|pos| ui.available_rect_before_wrap().contains(pos)) || app.view.drag.is_some();
-    let bvhs: Vec<(PieceId, Arc<Bvh>, Mat4)> = if over { drawn.iter().filter_map(|d| Some((d.id, app.view.bvh_for(d.mesh_id, &d.mesh, &ctx)?, d.model))).collect() } else { Vec::new() };
+    let show_paint = !app.doc.zones.is_empty() && app.step == Step::Split && app.view.tab == Tab::Model;
+    let over = ctx.pointer_hover_pos().is_some_and(|pos| ui.available_rect_before_wrap().contains(pos)) || tool_drag;
+    let bvhs: Vec<(PieceId, Arc<Bvh>, Mat4)> = if over || show_paint { drawn.iter().filter_map(|d| Some((d.id, app.view.bvh_for(d.mesh_id, &d.mesh, &ctx)?, d.model))).collect() } else { Vec::new() };
+    // Painted zones, drawn as marker on the surface.
+    if show_paint {
+        let to_local = if local_is_source { Mat4::IDENTITY } else { prepared_xf };
+        let key = fingerprint(&(&app.doc.zones, drawn.iter().map(|d| (d.mesh_id, d.model.to_cols_array().map(|x| x.to_bits()))).collect::<Vec<_>>(), to_local.to_cols_array().map(|x| x.to_bits())));
+        let ready = bvhs.len() == drawn.len();
+        if ready && app.view.paint_tris.as_ref().is_none_or(|c| c.0 != key) {
+            let list: Vec<(Arc<Bvh>, Mat4)> = bvhs.iter().map(|b| (b.1.clone(), b.2)).collect();
+            app.view.paint_tris = Some((key, Arc::new(paint_overlay(&app.doc.zones, &list, to_local, PAINT))));
+        }
+        if let Some((_, t)) = &app.view.paint_tris {
+            frame.tris.extend_from_slice(t);
+        }
+    }
     let clip_plane = frame.clip;
     // Returns (piece, world hit, normal, hit in the mesh's own coordinates).
     let pick_full = |ray: (Vec3, Vec3)| -> Option<(PieceId, Vec3, Vec3, Vec3)> {
@@ -647,7 +845,7 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     let mut hover_hit = None;
     if let Some(ray) = input.hover {
         if let Some((id, pt, n)) = pick(ray) {
-            hover_hit = Some((pt, n));
+            hover_hit = Some((id, pt, n));
             if id != u32::MAX {
                 app.view.hover = Some(id);
             }
@@ -655,39 +853,75 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     }
 
     // No-cut zone painting (on the unsplit model or pieces).
-    if app.view.paint && app.step == Step::Split {
+    if painting {
         if let Some(td) = input.tool_drag {
-            if let Some((_, _, _, local)) = pick_full(td.ray) {
+            if let Some((_, _, n, local)) = pick_full(td.ray) {
                 // Undo explode/lift offsets (local), then map prepared -> source.
-                let src = if local_is_source { local } else { prepared_xf.inverse().transform_point3(local) };
-                let scale = prepared_xf.to_scale_rotation_translation().0.abs().max_element().max(1e-6);
+                let inv = if local_is_source { Mat4::IDENTITY } else { prepared_xf.inverse() };
+                let src = inv.transform_point3(local);
+                let src_n = inv.transform_vector3(n).normalize_or_zero();
+                let scale = if local_is_source { 1.0 } else { prepared_xf.to_scale_rotation_translation().0.abs().max_element().max(1e-6) };
                 let r = app.view.brush / scale;
                 if app.view.erase {
                     app.doc.zones.erase(src, r);
-                } else if app.doc.zones.dabs.last().is_none_or(|d| d.p.distance(src) > r * 0.4) {
-                    app.doc.zones.dabs.push(Dab { p: src, radius: r });
+                } else if app.doc.zones.dabs.last().is_none_or(|d| d.p.distance(src) > r * 0.3) {
+                    app.doc.zones.dabs.push(Dab { p: src, radius: r, n: src_n });
                 }
             }
         }
-        if let Some((pt, n)) = hover_hit {
-            circle(&mut frame.overlay_lines, pt, n, app.view.brush, if app.view.erase { [1.0, 1.0, 1.0, 0.9] } else { rgba(p.accent, 0.95) }, 2.0);
-        }
-    }
-    if !app.doc.zones.is_empty() && app.step == Step::Split {
-        for d in &app.doc.zones.dabs {
-            let c = prepared_xf.transform_point3(d.p);
-            let scale = prepared_xf.to_scale_rotation_translation().0.abs().max_element();
-            let n = (c - scene_bb.center()).normalize_or(Vec3::Z);
-            circle(&mut frame.lines, c, n, d.radius * scale, [0.25, 0.55, 1.0, 0.75], 2.0);
+        if let Some((_, pt, n)) = hover_hit {
+            circle(&mut frame.overlay_lines, pt, n, app.view.brush, if app.view.erase { [1.0, 1.0, 1.0, 0.9] } else { [PAINT[0], PAINT[1], PAINT[2], 0.95] }, 2.0);
         }
     }
 
-    // Seam handles for the selected piece.
-    if app.view.tab == Tab::Model {
-        seam_handles(app, &mut frame, &input, rect, p);
+    // Drawing a cut line across the selected piece.
+    if drawing_cut {
+        let target = app.view.cut_draw.as_ref().map(|c| c.piece).unwrap();
+        let model = drawn.iter().find(|d| d.id == target).map(|d| d.model).unwrap_or(Mat4::IDENTITY);
+        if let Some(td) = input.tool_drag {
+            if td.started {
+                if let Some(c) = &mut app.view.cut_draw {
+                    c.pts.clear();
+                    c.normals.clear();
+                }
+            }
+            if let Some((_, _, n, local)) = pick_full(td.ray).filter(|h| h.0 == target) {
+                if let Some(c) = &mut app.view.cut_draw {
+                    if c.pts.last().is_none_or(|l| l.distance(local) > 0.8) {
+                        c.pts.push(local);
+                        c.normals.push(n);
+                    }
+                }
+            }
+            if td.stopped {
+                let done = app.view.cut_draw.clone().filter(|c| {
+                    let (lo, hi) = c.pts.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+                    c.pts.len() >= 2 && (hi - lo).length() > 4.0
+                });
+                if let Some(c) = done {
+                    app.view.cut_draw = None;
+                    cut_along_line(app, c);
+                }
+            }
+        }
+        if let Some(c) = &app.view.cut_draw {
+            let col = [1.0, 0.85, 0.2, 1.0];
+            for w in c.pts.windows(2) {
+                frame.overlay_lines.push(LineSeg::new(model.transform_point3(w[0]), model.transform_point3(w[1]), col, 3.0));
+            }
+            // The straight line it will be fitted to.
+            if c.pts.len() >= 2 {
+                let (a, b) = (c.pts[0], *c.pts.last().unwrap());
+                frame.overlay_lines.push(LineSeg::new(model.transform_point3(a), model.transform_point3(b), [1.0, 1.0, 1.0, 0.5], 1.5));
+            }
+        }
+        if let Some((_, pt, n)) = hover_hit.filter(|h| h.0 == target) {
+            circle(&mut frame.overlay_lines, pt, n, 2.5, [1.0, 0.85, 0.2, 1.0], 2.0);
+        }
     }
 
-    // Clicks: select, measure, context menu.
+    // Clicks: select (Shift adds to the selection), measure, context menu.
+    let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
     if let Some(ray) = input.click {
         let hit = pick(ray);
         if app.view.measure {
@@ -697,19 +931,24 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
                 }
                 app.view.measure_pts.push(pt);
             }
-        } else if !app.view.paint && app.view.tab == Tab::Model {
-            app.view.select(hit.map(|h| h.0).filter(|id| *id != u32::MAX));
+        } else if !painting && !drawing_cut && app.view.tab == Tab::Model {
+            match hit.map(|h| h.0).filter(|id| *id != u32::MAX) {
+                Some(id) if shift => app.view.toggle_select(id),
+                Some(id) => app.view.select(Some(id)),
+                None if !shift => app.view.select(None),
+                None => {}
+            }
         }
     }
     if let Some(ray) = input.right_click {
         if let Some((id, _, _)) = pick(ray) {
-            if id != u32::MAX {
+            if id != u32::MAX && !app.view.is_selected(id) {
                 app.view.select(Some(id));
             }
         }
     }
-    if let Some(id) = app.view.selected.filter(|_| app.doc.split.is_some() && app.view.tab == Tab::Model) {
-        resp.context_menu(|ui| parts::context_menu(app, ui, id));
+    if app.view.selected.is_some() && app.doc.split.is_some() && app.view.tab == Tab::Model && show_pieces {
+        resp.context_menu(|ui| parts::context_menu(app, ui));
     }
     // Measure line.
     if app.view.measure_pts.len() == 2 {
@@ -721,106 +960,19 @@ fn viewport(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
     overlays(app, ui, rect, p);
 }
 
-fn handle_under_pointer(app: &S3dApp, ui: &Ui) -> bool {
-    let Some(pos) = ui.ctx().pointer_hover_pos() else { return false };
-    let handles = app.view.handle_screen_positions.borrow();
-    handles.iter().any(|h| h.1.distance(pos) < 14.0)
-}
-
-fn seam_handles(app: &mut S3dApp, frame: &mut SceneFrame, input: &crate::viewport::ViewportInput, rect: egui::Rect, p: &Palette) {
-    app.view.handle_screen_positions.borrow_mut().clear();
-    let (Some(id), Some(split)) = (app.view.selected, app.doc.split.clone()) else { return };
-    let part = &split.partition;
-    let Some(q) = part.piece(id) else { return };
-    if q.locked {
-        return;
-    }
-    let center = part.pieces.iter().fold(Aabb::EMPTY, |b, x| b.union(&x.bbox)).center();
-    let off = if app.view.explode > 0.0 { explode_offset(q.centroid, center, app.view.explode) } else { Vec3::ZERO };
-    let accent = rgba(p.accent, 1.0);
-    let seams: Vec<_> = part.seams_of(id).cloned().collect();
-    for s in &seams {
-        // Point the arrow out of the selected piece.
-        let out = if s.a == id { -s.plane.normal } else { s.plane.normal }.as_vec3();
-        let pd = app.view.pending.filter(|pd| pd.seam == s.id).unwrap_or(PendingSeam { seam: s.id, offset: 0.0, tilt: 0.0 });
-        let pl = adjusted_plane(&s.plane, s.center, pd.offset, pd.tilt);
-        let c = pl.project(s.center.as_dvec3()).as_vec3() + off;
-        let len = (s.area.sqrt() as f32 * 0.3).clamp(15.0, 150.0);
-        let n = pl.normal.as_vec3() * out.dot(s.plane.normal.as_vec3()).signum();
-        let tip = c + n * len;
-        let hovered_seam = app.view.hover_seam == Some(s.id);
-        let col = if hovered_seam { [1.0, 1.0, 1.0, 1.0] } else { accent };
-        frame.overlay_lines.push(LineSeg::new(c, tip, col, 3.0));
-        // Arrow head.
-        let side = tilt_axis(&pl).as_vec3();
-        frame.overlay_lines.push(LineSeg::new(tip, tip - n * len * 0.18 + side * len * 0.1, col, 3.0));
-        frame.overlay_lines.push(LineSeg::new(tip, tip - n * len * 0.18 - side * len * 0.1, col, 3.0));
-        // Tilt knob: an arc in the plane containing the normal, around the tilt axis.
-        let u = side.cross(n).normalize_or_zero();
-        let knob = c + u * len * 0.8;
-        let mut prev = None;
-        for i in 0..=16 {
-            let a = (i as f32 / 16.0 - 0.5) * 1.2;
-            let pt = c + (u * a.cos() + n * a.sin()) * len * 0.8;
-            if let Some(pp) = prev {
-                frame.overlay_lines.push(LineSeg::new(pp, pt, [0.4, 0.75, 1.0, 1.0], 2.5));
-            }
-            prev = Some(pt);
-        }
-        // Outline of the pending plane.
-        if app.view.pending.is_some_and(|x| x.seam == s.id) {
-            plane_outline(frame, pl, c, (s.area.sqrt() as f32).max(20.0), [1.0, 0.85, 0.2, 1.0]);
-        }
-        if let (Some(sc), Some(sk)) = (app.view.viewport.to_screen(rect, tip), app.view.viewport.to_screen(rect, knob)) {
-            let mut hs = app.view.handle_screen_positions.borrow_mut();
-            hs.push((s.id, sc, HandleKindTag::Move, n));
-            hs.push((s.id, sk, HandleKindTag::Tilt, n));
-        }
-    }
-    // Drag handling.
-    let pos = input.response.as_ref().and_then(|r| r.interact_pointer_pos().or(r.hover_pos()));
-    if let Some(td) = input.tool_drag {
-        if app.view.drag.is_none() && td.started {
-            if let Some(pos) = pos {
-                let hs = app.view.handle_screen_positions.borrow().clone();
-                if let Some(h) = hs.iter().min_by(|a, b| a.1.distance(pos).total_cmp(&b.1.distance(pos))).filter(|h| h.1.distance(pos) < 16.0) {
-                    let start = app.view.pending.filter(|pd| pd.seam == h.0).unwrap_or(PendingSeam { seam: h.0, offset: 0.0, tilt: 0.0 });
-                    app.view.drag = Some(HandleDrag { seam: h.0, kind: if matches!(h.2, HandleKindTag::Move) { HandleKind::Move } else { HandleKind::Tilt }, start, accum: Vec2::ZERO });
-                }
-            }
-        }
-        if let Some(mut d) = app.view.drag {
-            d.accum += Vec2::new(td.delta_px.x, td.delta_px.y);
-            app.view.drag = Some(d);
-            if let Some(s) = part.seam(d.seam) {
-                // Screen direction of the normal decides drag sign and scale.
-                let c = s.center + off;
-                let n = s.plane.normal.as_vec3() * if s.a == id { -1.0 } else { 1.0 };
-                let len = (s.area.sqrt() as f32 * 0.3).clamp(15.0, 150.0);
-                if let (Some(a), Some(b)) = (app.view.viewport.to_screen(rect, c), app.view.viewport.to_screen(rect, c + n * len)) {
-                    let sd = b - a;
-                    let px_per_mm = sd.length() / len;
-                    let along = d.accum.dot(sd.normalized());
-                    let mut pd = d.start;
-                    let sign = if s.a == id { -1.0 } else { 1.0 };
-                    match d.kind {
-                        HandleKind::Move => pd.offset = (d.start.offset + sign * along / px_per_mm.max(1e-3)).round(),
-                        HandleKind::Tilt => pd.tilt = (d.start.tilt + along * 0.25).clamp(-60.0, 60.0).round(),
-                    }
-                    app.view.set_pending(pd);
-                }
-            }
-        }
-        if td.stopped {
-            app.view.drag = None;
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum HandleKindTag {
-    Move,
-    Tilt,
+/// Cuts a piece along a line the user drew: the stroke is fitted with a
+/// straight line and the cut angle chosen for printing (in the background).
+pub fn cut_along_line(app: &mut S3dApp, c: CutDraw) {
+    let zones = app.doc.placement().map(|xf| app.doc.zones.transformed(&xf)).unwrap_or_default();
+    let Some(split) = &app.doc.split else { return };
+    let settings = app.doc.settings.clone();
+    let part = split.partition.clone();
+    app.start_edit_with(move |job| {
+        job.set_stage("Fitting the cut to the line");
+        let q = s3d_core::split::quality::QualityParams::from_settings(&settings).with_zones(&zones);
+        let plane = s3d_core::split::refine::cut_along(&part, c.piece, &c.pts, &c.normals, &q, job).ok_or_else(|| "the line does not cross the piece".to_string())?;
+        Ok(EditOp::Cut(c.piece, plane))
+    });
 }
 
 fn circle(out: &mut Vec<LineSeg>, c: Vec3, n: Vec3, r: f32, color: [f32; 4], w: f32) {
@@ -846,17 +998,6 @@ fn plane_quad(frame: &mut SceneFrame, pl: Plane, c: Vec3, size: f32, color: [f32
         }
     }
 }
-
-fn plane_outline(frame: &mut SceneFrame, pl: Plane, c: Vec3, size: f32, color: [f32; 4]) {
-    let (u, v) = pl.basis();
-    let (u, v) = (u.as_vec3() * size * 0.6, v.as_vec3() * size * 0.6);
-    let q = [c - u - v, c + u - v, c + u + v, c - u + v];
-    for i in 0..4 {
-        frame.overlay_lines.push(LineSeg::new(q[i], q[(i + 1) % 4], color, 1.5));
-    }
-    plane_quad(frame, pl, c, size * 1.2, [color[0], color[1], color[2], 0.12]);
-}
-
 /// Ground grid under the model and a wireframe of the printer's build volume.
 /// Returns the bounds of the build-volume box (included when fitting the view).
 fn ground_and_printer(frame: &mut SceneFrame, bb: &Aabb, doc: &Document, p: &Palette) -> Aabb {
@@ -872,7 +1013,7 @@ fn ground_and_printer(frame: &mut SceneFrame, bb: &Aabb, doc: &Document, p: &Pal
         frame.lines.push(LineSeg::new(Vec3::new(cx - n as f32 * step, cy + o, 0.0), Vec3::new(cx + n as f32 * step, cy + o, 0.0), col, 1.0));
     }
     // Build volume, placed beside the model for scale.
-    let v = doc.settings.printer.printer.volume;
+    let v = doc.settings.printer.volume;
     let o = Vec3::new(bb.max.x + v[0] * 0.25 + 20.0, bb.min.y, 0.0);
     let s = Vec3::new(v[0], v[1], v[2]);
     let corner = |i: usize| o + Vec3::new(if i & 1 != 0 { s.x } else { 0.0 }, if i & 2 != 0 { s.y } else { 0.0 }, if i & 4 != 0 { s.z } else { 0.0 });
@@ -887,7 +1028,6 @@ fn ground_and_printer(frame: &mut SceneFrame, bb: &Aabb, doc: &Document, p: &Pal
 /// 2D overlays drawn by egui on top of the 3D image: labels, measure text.
 fn overlays(app: &mut S3dApp, ui: &mut Ui, rect: egui::Rect, p: &Palette) {
     let painter = ui.painter_at(rect);
-    // Printer label next to its build volume.
     let font = egui::FontId::monospace(12.0);
     if app.view.measure_pts.len() == 2 {
         let (a, b) = (app.view.measure_pts[0], app.view.measure_pts[1]);
@@ -905,6 +1045,10 @@ fn overlays(app: &mut S3dApp, ui: &mut Ui, rect: egui::Rect, p: &Palette) {
     if app.view.paint && app.step == Step::Split {
         painter.text(rect.left_top() + Vec2::new(12.0, 12.0), egui::Align2::LEFT_TOP, "Painting no-cut zones · drag on the model · right-drag to pan", font.clone(), p.accent);
     }
+    if let Some(c) = &app.view.cut_draw {
+        let label = app.doc.split.as_ref().and_then(|s| s.partition.piece(c.piece)).map(|q| q.label).unwrap_or(0);
+        painter.text(rect.left_top() + Vec2::new(12.0, 12.0), egui::Align2::LEFT_TOP, format!("Draw where piece #{label} should be cut · the line is straightened and the cut angled for printing · Esc to cancel"), font.clone(), p.accent);
+    }
     if app.jobs.current.as_ref().is_some_and(|r| r.kind == crate::jobs::JobKind::Split) {
         if let Some((_, msg)) = app.view.search_preview.lock().unwrap().as_ref() {
             painter.text(rect.left_top() + Vec2::new(14.0, 12.0), egui::Align2::LEFT_TOP, format!("Best layout so far: {msg}"), theme::semibold(14.0), p.text_strong);
@@ -914,16 +1058,22 @@ fn overlays(app: &mut S3dApp, ui: &mut Ui, rect: egui::Rect, p: &Palette) {
     if let Some(split) = &app.doc.split {
         if app.view.tab == Tab::Assembly {
             if let Some(a) = app.view.assembly(&app.doc) {
-                let step = app.view.assembly_step.min(a.order.len().saturating_sub(1));
-                if let Some(q) = a.order.get(step).and_then(|id| split.partition.piece(*id)) {
-                    let msg = format!("Step {} of {}: add piece #{}", step + 1, a.order.len(), q.label);
-                    painter.text(rect.left_top() + Vec2::new(14.0, 12.0), egui::Align2::LEFT_TOP, msg, theme::semibold(15.0), p.text_strong);
-                    if a.blocked.contains(&q.id) {
-                        painter.text(rect.left_top() + Vec2::new(14.0, 34.0), egui::Align2::LEFT_TOP, "No straight path: insert before its neighbours or glue without pins", egui::FontId::proportional(13.0), p.warn);
+                let k = app.view.assembly_step.min(a.steps.len());
+                let total = a.steps.len() + 1;
+                let (msg, sub) = match a.steps.get(k) {
+                    Some(st) => {
+                        let what = |name: &str, ids: &[PieceId]| if ids.len() == 1 { name.to_string() } else { format!("{name} ({} pieces)", ids.len()) };
+                        (
+                            format!("Step {} of {total}: join {} and {} into section {}", k + 1, what(&st.a_name, &st.a), what(&st.b_name, &st.b), st.name),
+                            format!("Seam about {:.0} mm · about {:.0} heat staples from the inside", st.length, (st.length / 40.0).ceil().max(1.0)),
+                        )
                     }
-                }
+                    None => (format!("Step {total} of {total}: assembled"), format!("{} pieces", split.partition.pieces.len())),
+                };
+                painter.text(rect.left_top() + Vec2::new(14.0, 12.0), egui::Align2::LEFT_TOP, msg, theme::semibold(15.0), p.text_strong);
+                painter.text(rect.left_top() + Vec2::new(14.0, 34.0), egui::Align2::LEFT_TOP, sub, egui::FontId::proportional(13.0), p.text_weak);
             }
-        } else if matches!(app.step, Step::Split | Step::Connectors | Step::Export) {
+        } else if matches!(app.step, Step::Split | Step::Features | Step::Export) {
             // Label pieces near the cursor's selection, and all of them when exploded.
             let center = split.partition.pieces.iter().fold(Aabb::EMPTY, |b, x| b.union(&x.bbox)).center();
             for q in &split.partition.pieces {
@@ -931,7 +1081,7 @@ fn overlays(app: &mut S3dApp, ui: &mut Ui, rect: egui::Rect, p: &Palette) {
                     continue;
                 }
                 let many = split.partition.pieces.len() > 80;
-                let show = (app.view.explode > 0.05 && !many) || app.view.selected == Some(q.id) || app.view.hover == Some(q.id);
+                let show = (app.view.explode > 0.05 && !many) || app.view.is_selected(q.id) || app.view.hover == Some(q.id);
                 if !show {
                     continue;
                 }
@@ -950,194 +1100,33 @@ fn overlays(app: &mut S3dApp, ui: &mut Ui, rect: egui::Rect, p: &Palette) {
 }
 
 // ---------------------------------------------------------------------------
-// Beds view
-
-fn footprint(view: &mut ViewState, key: u64, mesh: &Mesh, print: Mat4) -> Arc<Vec<glam::Vec2>> {
-    view.footprints
-        .entry(key)
-        .or_insert_with(|| {
-            let pts: Vec<glam::DVec2> = mesh.verts.iter().map(|v| {
-                let q = print.transform_point3(*v);
-                glam::DVec2::new(q.x as f64, q.y as f64)
-            }).collect();
-            Arc::new(hull(pts).into_iter().map(|p| p.as_vec2()).collect())
-        })
-        .clone()
-}
-
-fn hull(mut pts: Vec<glam::DVec2>) -> Vec<glam::DVec2> {
-    pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
-    pts.dedup();
-    if pts.len() < 3 {
-        return pts;
-    }
-    let mut h: Vec<glam::DVec2> = Vec::new();
-    for pass in 0..2 {
-        let start = h.len();
-        let seq: Vec<glam::DVec2> = if pass == 0 { pts.clone() } else { pts.iter().rev().cloned().collect() };
-        for p in seq {
-            while h.len() >= start + 2 && (h[h.len() - 1] - h[h.len() - 2]).perp_dot(p - h[h.len() - 2]) <= 0.0 {
-                h.pop();
-            }
-            h.push(p);
-        }
-        h.pop();
-    }
-    h
-}
-
-fn beds_view(app: &mut S3dApp, ui: &mut Ui, p: &Palette) {
-    let Some(split) = app.doc.split.clone() else { return };
-    if app.view.beds.beds.is_empty() {
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.4);
-            ui.label(widgets::weak(ui, "Pieces are not arranged on beds yet."));
-            ui.add_space(6.0);
-            if ui.add_enabled(!app.jobs.busy(), egui::Button::new("Arrange beds")).clicked() {
-                app.start_arrange();
-            }
-        });
-        return;
-    }
-    let stale = app.view.beds_key != Some(arrange_key(&app.doc));
-    ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.label(RichText::new(format!("{} beds", app.view.beds.beds.len())).font(theme::semibold(14.0)).color(p.text_strong));
-        ui.label(widgets::weak(ui, "· drag pieces to move them, right-click to rotate 90°"));
-        if stale {
-            ui.label(RichText::new("· out of date").color(p.warn));
-            if ui.add_enabled(!app.jobs.busy(), egui::Button::new("Arrange again").small()).clicked() {
-                app.start_arrange();
-            }
-        }
-    });
-    let bed = app.view.beds.bed;
-    let avail = ui.available_size();
-    let cols = ((avail.x / 300.0).floor() as usize).clamp(1, 6);
-    let cell_w = (avail.x - 24.0) / cols as f32 - 12.0;
-    let scale = cell_w / bed[0].max(bed[1]);
-    let card_h = bed[1] * scale + 34.0;
-    let n = app.view.beds.beds.len();
-    let mut drop: Option<(PieceId, usize, glam::Vec2)> = None;
-    let mut rotate: Option<PieceId> = None;
-    let pointer = ui.ctx().pointer_interact_pos();
-    let released = ui.input(|i| i.pointer.any_released());
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.add_space(6.0);
-        let mut bed_rects = Vec::new();
-        for row in 0..n.div_ceil(cols) {
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                for c in 0..cols {
-                    let b = row * cols + c;
-                    if b >= n {
-                        break;
-                    }
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(cell_w, card_h), egui::Sense::hover());
-                    let painter = ui.painter_at(rect.expand(2.0));
-                    painter.text(rect.left_top() + Vec2::new(2.0, 2.0), egui::Align2::LEFT_TOP, format!("Bed {}", b + 1), theme::semibold(13.0), p.text_strong);
-                    painter.text(rect.right_top() + Vec2::new(-2.0, 2.0), egui::Align2::RIGHT_TOP, format!("{} pieces", app.view.beds.beds[b].len()), egui::FontId::proportional(12.0), p.text_weak);
-                    let plate = egui::Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 24.0), Vec2::new(bed[0] * scale, bed[1] * scale));
-                    painter.rect(plate, CornerRadius::same(4), p.field, Stroke::new(1.0, p.field_stroke), egui::StrokeKind::Inside);
-                    bed_rects.push((b, plate));
-                    let to_screen = |x: f32, y: f32| pos2(plate.left() + x * scale, plate.bottom() - y * scale);
-                    for pl in app.view.beds.beds[b].clone() {
-                        let Some(q) = split.partition.piece(pl.piece) else { continue };
-                        let print = q.orient.map(|o| o.matrix()).unwrap_or(Mat4::IDENTITY);
-                        let fp = footprint(&mut app.view, split.mesh_id(q.rev), q.display_mesh(), print);
-                        let (s, co) = pl.angle.sin_cos();
-                        let dragging = app.view.bed_drag.is_some_and(|d| d.0 == pl.piece);
-                        let shift = if dragging { app.view.bed_drag.unwrap().1 } else { Vec2::ZERO };
-                        let pts: Vec<egui::Pos2> = fp.iter().map(|v| to_screen(pl.x + co * v.x - s * v.y, pl.y + s * v.x + co * v.y) + shift).collect();
-                        let col = parts::swatch(piece_color(q.label, p.dark));
-                        let sel = app.view.selected == Some(q.id);
-                        painter.add(egui::Shape::convex_polygon(pts.clone(), col.gamma_multiply(if dragging { 0.6 } else { 0.85 }), Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { p.accent } else { col.gamma_multiply(0.5) })));
-                        let c = to_screen(pl.x, pl.y) + shift;
-                        painter.text(c, egui::Align2::CENTER_CENTER, format!("{}", q.label), theme::semibold(11.0), Color32::from_rgb(0x15, 0x18, 0x1F));
-                        // Interaction on the footprint's bounding box.
-                        let bbox = egui::Rect::from_points(&pts);
-                        let id = ui.scope_id().with(("bedpiece", pl.piece));
-                        let r = ui.interact(bbox, id, egui::Sense::click_and_drag());
-                        if r.drag_started() {
-                            app.view.bed_drag = Some((pl.piece, Vec2::ZERO));
-                            app.view.select(Some(pl.piece));
-                        }
-                        if r.dragged() {
-                            if let Some(d) = &mut app.view.bed_drag {
-                                d.1 += r.drag_delta();
-                            }
-                        }
-                        if r.clicked() {
-                            app.view.select(Some(pl.piece));
-                        }
-                        if r.secondary_clicked() {
-                            rotate = Some(pl.piece);
-                        }
-                        r.on_hover_text(format!("Piece #{}", q.label));
-                    }
-                    ui.add_space(12.0);
-                }
-            });
-            ui.add_space(10.0);
-        }
-        if released {
-            if let (Some((id, _)), Some(pos)) = (app.view.bed_drag, pointer) {
-                if let Some((b, plate)) = bed_rects.iter().find(|(_, r)| r.contains(pos)) {
-                    drop = Some((id, *b, glam::Vec2::new((pos.x - plate.left()) / scale, (plate.bottom() - pos.y) / scale)));
-                }
-            }
-            app.view.bed_drag = None;
-        }
-    });
-    if let Some((id, b, at)) = drop {
-        move_piece(&mut app.view.beds, id, b, at);
-        app.doc.dirty = true;
-    }
-    if let Some(id) = rotate {
-        for bedv in &mut app.view.beds.beds {
-            for pl in bedv.iter_mut().filter(|pl| pl.piece == id) {
-                pl.angle = (pl.angle + std::f32::consts::FRAC_PI_2) % std::f32::consts::TAU;
-            }
-        }
-        app.doc.dirty = true;
-    }
-}
-
-fn move_piece(l: &mut Layout, id: PieceId, bed: usize, at: glam::Vec2) {
-    let mut pl = None;
-    for b in &mut l.beds {
-        if let Some(i) = b.iter().position(|p| p.piece == id) {
-            pl = Some(b.remove(i));
-        }
-    }
-    if let Some(mut pl) = pl {
-        pl.x = at.x;
-        pl.y = at.y;
-        l.beds[bed].push(pl);
-    }
-    l.beds.retain(|b| !b.is_empty());
-}
-
-// ---------------------------------------------------------------------------
 // Automatic cuts for "Split in two" / "Find a better cut".
 
+/// Reworks a piece and its surroundings: its shared cuts moved, then turned,
+/// then the piece split (see `refine::improve_piece`).
 pub fn find_better_cut(app: &mut S3dApp, id: PieceId) {
-    split_with_best_cut(app, id);
-}
-
-pub fn split_piece_auto(app: &mut S3dApp, id: PieceId) {
-    split_with_best_cut(app, id);
-}
-
-fn split_with_best_cut(app: &mut S3dApp, id: PieceId) {
+    let zones = app.doc.placement().map(|xf| app.doc.zones.transformed(&xf)).unwrap_or_default();
     let Some(split) = &app.doc.split else { return };
-    let Some(r) = PieceRef::of(&split.partition, id) else { return };
     let settings = app.doc.settings.clone();
     let part = split.partition.clone();
     app.start_edit_with(move |job| {
-        job.set_stage("Searching for a better cut");
-        let params = s3d_core::split::orient_params(&settings);
-        let plane = s3d_core::split::fix::best_cut(&part, id, &params, job).ok_or_else(|| "no cut improves this piece".to_string())?;
-        Ok(EditOp::Cut { piece: r, plane })
+        job.set_stage("Trying cuts nearby, then other angles, then extra cuts");
+        let q = s3d_core::split::quality::QualityParams::from_settings(&settings).with_zones(&zones);
+        let i = s3d_core::split::refine::improve_piece(&part, id, &q, job).ok_or("no better cut found: moving or turning its cuts and splitting it all made things worse")?;
+        Ok(EditOp::Replace { old: i.old, new: i.new, planes: i.planes })
+    });
+}
+
+/// Adds the single cut through a piece that prints best.
+pub fn split_piece_auto(app: &mut S3dApp, id: PieceId) {
+    let zones = app.doc.placement().map(|xf| app.doc.zones.transformed(&xf)).unwrap_or_default();
+    let Some(split) = &app.doc.split else { return };
+    let settings = app.doc.settings.clone();
+    let part = split.partition.clone();
+    app.start_edit_with(move |job| {
+        job.set_stage("Searching for the best cut");
+        let q = s3d_core::split::quality::QualityParams::from_settings(&settings).with_zones(&zones);
+        let (plane, _) = s3d_core::split::refine::best_split(&part, id, &q, &zones, job).ok_or("this piece cannot be cut")?;
+        Ok(EditOp::Cut(id, plane))
     });
 }

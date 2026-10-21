@@ -29,7 +29,6 @@ unsafe extern "C" {
     fn s3d_mf_is_empty(h: *const RawMf) -> i32;
     fn s3d_mf_num_tri(h: *const RawMf) -> u64;
     fn s3d_mf_volume(h: *const RawMf) -> f64;
-    fn s3d_mf_surface_area(h: *const RawMf) -> f64;
     fn s3d_mf_genus(h: *const RawMf) -> i32;
     fn s3d_mf_bbox(h: *const RawMf, out6: *mut f64);
     fn s3d_mf_get_mesh(h: *const RawMf) -> *mut RawMesh;
@@ -80,7 +79,6 @@ pub type GResult<T> = Result<T, GeomError>;
 pub enum Op {
     Union = 0,
     Subtract = 1,
-    Intersect = 2,
 }
 
 pub struct Solid {
@@ -159,9 +157,6 @@ impl Solid {
     pub fn volume(&self) -> f64 {
         unsafe { s3d_mf_volume(self.h) }
     }
-    pub fn surface_area(&self) -> f64 {
-        unsafe { s3d_mf_surface_area(self.h) }
-    }
     pub fn genus(&self) -> i32 {
         unsafe { s3d_mf_genus(self.h) }
     }
@@ -182,9 +177,6 @@ impl Solid {
     }
     pub fn subtract(&self, other: &Solid) -> GResult<Solid> {
         self.boolean(other, Op::Subtract)
-    }
-    pub fn intersect(&self, other: &Solid) -> GResult<Solid> {
-        self.boolean(other, Op::Intersect)
     }
 
     pub fn batch(solids: &[&Solid], op: Op) -> GResult<Solid> {

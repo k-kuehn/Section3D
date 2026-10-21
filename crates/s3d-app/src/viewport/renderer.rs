@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use eframe::{egui, egui_wgpu};
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 use glam::{Mat4, Vec3, Vec4};
@@ -62,6 +63,8 @@ pub struct TriVert {
 pub struct SceneFrame {
     pub view_proj: Mat4,
     pub eye: Vec3,
+    /// Lines are drawn this much nearer the eye: (mm, mm per mm of distance).
+    pub line_bias: [f32; 2],
     pub clip: Option<Vec4>,
     pub overhang_sin: f32,
     pub cap_color: [f32; 4],
@@ -85,6 +88,7 @@ struct Globals {
     params: [f32; 4],
     cap_color: [f32; 4],
     support_color: [f32; 4],
+    line_bias: [f32; 4],
 }
 
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -338,7 +342,7 @@ impl Renderer3d {
         let live: std::collections::HashSet<u64> = frame.meshes.iter().map(|m| m.id).collect();
         self.meshes.retain(|id, _| live.contains(id));
         for m in &frame.meshes {
-            if self.meshes.get(&m.id).is_some_and(|g| g.rev == m.rev) {
+            if self.meshes.get(&m.id).is_some_and(|g| g.rev == m.rev) || m.mesh.tris.is_empty() {
                 continue;
             }
             let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -367,6 +371,7 @@ impl Renderer3d {
             params: [frame.overhang_sin, if frame.clip.is_some() { 1.0 } else { 0.0 }, frame.size_px[0] as f32, frame.size_px[1] as f32],
             cap_color: frame.cap_color,
             support_color: frame.support_color,
+            line_bias: [frame.line_bias[0], frame.line_bias[1], 0.0, 0.0],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
 

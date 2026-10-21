@@ -1,8 +1,9 @@
 //! Section3D desktop application.
 
+use eframe::egui;
 pub mod app;
+pub mod beds;
 pub mod doc;
-pub mod export;
 pub mod jobs;
 pub mod logo;
 pub mod panels;

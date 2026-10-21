@@ -1,8 +1,9 @@
-//! Background jobs: one at a time, with progress, cancel and panic capture.
+//! Background jobs: one at a time, with a stage line, cancel and panic capture.
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Instant;
 
+use eframe::egui;
 use s3d_core::job::JobCtx;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,7 +11,7 @@ pub enum JobKind {
     Import,
     Hollow,
     Split,
-    Connectors,
+    Features,
     Edit,
     Arrange,
     Export,
@@ -24,7 +25,7 @@ impl JobKind {
             JobKind::Import => "Importing",
             JobKind::Hollow => "Hollowing",
             JobKind::Split => "Splitting",
-            JobKind::Connectors => "Adding connectors",
+            JobKind::Features => "Adding features",
             JobKind::Edit => "Applying edit",
             JobKind::Arrange => "Arranging beds",
             JobKind::Export => "Exporting",

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use glam::{EulerRot, Mat4, Quat, Vec3};
-use s3d_core::edits::{EditOp, EditStatus};
+use s3d_core::edits::EditEntry;
 use s3d_core::mesh::Mesh;
 use s3d_core::partition::Partition;
 use s3d_core::repair::Health;
@@ -16,18 +16,18 @@ pub enum Step {
     Import,
     Prepare,
     Split,
-    Connectors,
+    Features,
     Export,
 }
 
 impl Step {
-    pub const ALL: [Step; 5] = [Step::Import, Step::Prepare, Step::Split, Step::Connectors, Step::Export];
+    pub const ALL: [Step; 5] = [Step::Import, Step::Prepare, Step::Split, Step::Features, Step::Export];
     pub fn label(self) -> &'static str {
         match self {
             Step::Import => "Import",
             Step::Prepare => "Prepare",
             Step::Split => "Split",
-            Step::Connectors => "Connectors",
+            Step::Features => "Features",
             Step::Export => "Export",
         }
     }
@@ -65,7 +65,7 @@ pub struct SplitState {
     pub partition: Partition,
     /// Fingerprint of everything the split depended on.
     pub key: u64,
-    /// Fingerprint of the connector settings the pieces were finished with.
+    /// Fingerprint of the feature settings (pins, numbers) the pieces were finished with.
     pub conn_key: Option<u64>,
     /// Distinguishes GPU mesh ids across results.
     pub generation: u64,
@@ -83,8 +83,7 @@ impl SplitState {
 #[derive(Clone)]
 pub struct Snapshot {
     pub settings: Settings,
-    pub edits: Vec<EditOp>,
-    pub edit_status: Vec<EditStatus>,
+    pub edits: Vec<EditEntry>,
     pub zones: Zones,
     pub split: Option<Arc<SplitState>>,
     pub hollow: Option<Hollow>,
@@ -96,8 +95,8 @@ pub struct Document {
     pub hollow: Option<Hollow>,
     pub zones: Zones,
     pub split: Option<Arc<SplitState>>,
-    pub edits: Vec<EditOp>,
-    pub edit_status: Vec<EditStatus>,
+    /// Manual edits made since the split (a log, shown in the Split step).
+    pub edits: Vec<EditEntry>,
     pub path: Option<PathBuf>,
     pub dirty: bool,
     /// View state loaded from a project, consumed by the view.
@@ -108,7 +107,8 @@ pub struct Document {
     placement_cache: Option<(u64, Mat4)>,
 }
 
-/// Inputs of the Split step except the edit list (see `Document::split_key`).
+/// Inputs of the Split step. Manual edits are not among them: they change
+/// the pieces in place and are discarded by the next split.
 #[derive(Clone, serde::Serialize)]
 pub struct SplitKeyParts {
     transform: u64,
@@ -119,8 +119,8 @@ pub struct SplitKeyParts {
 }
 
 impl SplitKeyParts {
-    pub fn key(&self, edits: &[EditOp]) -> u64 {
-        fingerprint(&(self.transform, self.hollow, &self.printer, &self.split, &self.zones, edits))
+    pub fn key(&self) -> u64 {
+        fingerprint(&(self.transform, self.hollow, &self.printer, &self.split, &self.zones))
     }
 }
 
@@ -140,7 +140,6 @@ impl Default for Document {
             zones: Zones::default(),
             split: None,
             edits: Vec::new(),
-            edit_status: Vec::new(),
             path: None,
             dirty: false,
             extra_view: None,
@@ -205,22 +204,15 @@ impl Document {
         Some((s.mesh.clone(), s.mesh_id, t))
     }
 
-    /// Full source → prepared transform: shape transform, then centred on
-    /// the origin in XY and resting on z = 0.
-    pub fn prepared_transform(&mut self) -> Mat4 {
-        self.prepared_mesh().map(|(_, m)| m).unwrap_or(Mat4::IDENTITY)
-    }
-
     /// The model as it will be split, and the source → prepared transform.
     pub fn prepared_mesh(&mut self) -> Option<(Arc<Mesh>, Mat4)> {
-        let src = self.source.as_ref()?;
+        self.source.as_ref()?;
         let key = self.transform_key();
         if let Some((k, m, t)) = &self.prepared_cache {
             if *k == key {
                 return Some((self.valid_hollow().map(|h| h.mesh.clone()).unwrap_or_else(|| m.clone()), *t));
             }
         }
-        let _ = src;
         let t = self.placement()?;
         let m = Arc::new(self.source.as_ref()?.mesh.transformed(&t));
         self.prepared_cache = Some((key, m.clone(), t));
@@ -248,7 +240,7 @@ impl Document {
 
     /// Fingerprint of all inputs of the Split step.
     pub fn split_key(&self) -> u64 {
-        self.split_key_parts().key(&self.edits)
+        self.split_key_parts().key()
     }
 
     pub fn conn_key(&self) -> u64 {
@@ -270,7 +262,7 @@ impl Document {
                 Some(s) if s.key != self.split_key() || self.status(Step::Prepare) == Status::Stale => Status::Stale,
                 Some(_) => Status::Done,
             },
-            Step::Connectors => match &self.split {
+            Step::Features => match &self.split {
                 None => Status::NotRun,
                 Some(s) => {
                     if self.status(Step::Split) == Status::Stale || s.conn_key != Some(self.conn_key()) {
@@ -282,7 +274,7 @@ impl Document {
             },
             Step::Export => match (&self.split, self.exported_key) {
                 (None, _) | (_, None) => Status::NotRun,
-                (Some(_), Some(k)) if self.status(Step::Connectors) != Status::Done || k != self.export_key_basic() => Status::Stale,
+                (Some(_), Some(k)) if self.status(Step::Features) != Status::Done || k != self.export_key_basic() => Status::Stale,
                 _ => Status::Done,
             },
         }
@@ -297,7 +289,6 @@ impl Document {
         Snapshot {
             settings: self.settings.clone(),
             edits: self.edits.clone(),
-            edit_status: self.edit_status.clone(),
             zones: self.zones.clone(),
             split: self.split.clone(),
             hollow: self.hollow.clone(),
@@ -307,7 +298,6 @@ impl Document {
     pub fn restore(&mut self, s: Snapshot) {
         self.settings = s.settings;
         self.edits = s.edits;
-        self.edit_status = s.edit_status;
         self.zones = s.zones;
         self.split = s.split;
         self.hollow = s.hollow;

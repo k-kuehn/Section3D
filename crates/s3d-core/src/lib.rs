@@ -17,7 +17,6 @@ pub mod orient;
 pub mod pack;
 pub mod partition;
 pub mod plane;
-pub mod printers;
 pub mod project;
 pub mod render;
 pub mod repair;

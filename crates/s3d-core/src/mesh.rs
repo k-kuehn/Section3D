@@ -186,9 +186,29 @@ impl Mesh {
             .reduce(|| Aabb::EMPTY, |a, b| a.union(&b))
     }
 
-    /// Flat-shaded vertex stream (3 verts per triangle) for rendering.
-    pub fn unindexed_positions(&self) -> Vec<Vec3> {
-        self.tris.par_iter().flat_map_iter(|t| t.map(|i| self.verts[i as usize])).collect()
+    /// Edges shared by exactly two triangles: (vertex a, vertex b, triangle
+    /// 1, triangle 2).
+    pub fn edge_pairs(&self) -> Vec<(u32, u32, u32, u32)> {
+        let mut e: Vec<(u64, u32)> = Vec::with_capacity(self.tris.len() * 3);
+        for (t, tri) in self.tris.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                e.push((((a.min(b) as u64) << 32) | a.max(b) as u64, t as u32));
+            }
+        }
+        e.par_sort_unstable();
+        e.chunk_by(|a, b| a.0 == b.0).filter(|g| g.len() == 2).map(|g| ((g[0].0 >> 32) as u32, g[0].0 as u32, g[0].1, g[1].1)).collect()
+    }
+
+    /// Edges where faces meet at more than `deg` (outlines of the shape).
+    pub fn feature_edges(&self, deg: f32) -> Vec<[Vec3; 2]> {
+        let n = self.face_normals();
+        let cos = deg.to_radians().cos();
+        self.edge_pairs()
+            .into_iter()
+            .filter(|&(_, _, t1, t2)| n[t1 as usize].dot(n[t2 as usize]) < cos)
+            .map(|(a, b, _, _)| [self.verts[a as usize], self.verts[b as usize]])
+            .collect()
     }
 }
 

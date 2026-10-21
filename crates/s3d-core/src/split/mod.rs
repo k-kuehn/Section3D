@@ -1,17 +1,20 @@
-//! The Split job: plan cuts, apply them, clean up, replay edits, orient.
+//! The Split job: lay out cells (Shatter) or a grid, cut, then (Shatter
+//! only) refine the pieces until they print well, and number them. Manual
+//! edits made on an earlier result are not replayed: a fresh split starts
+//! over.
 
-pub mod cleanup;
-pub mod fix;
 pub mod grid;
-pub mod triangle;
+pub mod quality;
+pub mod refine;
+pub mod shatter;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use rayon::prelude::*;
 
 use crate::bsp::{self, Plan};
-use crate::edits::{self, EditOp, EditStatus};
 use crate::job::JobCtx;
 use crate::manifold::Solid;
 use crate::mesh::Mesh;
@@ -21,24 +24,37 @@ use crate::plane::Plane;
 use crate::settings::{Settings, SplitMode};
 use crate::zones::Zones;
 
+/// Receives cut lines on the model surface and a status line while the
+/// split runs, for a live preview.
+pub type PreviewFn = Arc<dyn Fn(Vec<[Vec3; 2]>, String) + Send + Sync>;
+
+/// Uniform random number in [0, 1) from a splitmix64 state.
+pub fn rand01(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
 pub struct SplitInput {
     /// Prepared (transformed, maybe hollowed) model.
     pub mesh: Arc<Mesh>,
     pub settings: Settings,
     /// No-cut zones in prepared coordinates.
     pub zones: Zones,
-    pub edits: Vec<EditOp>,
     /// Locked pieces carried over unchanged from the previous result.
     pub keep: Vec<Arc<Solid>>,
     /// Cut planes bounding the locked pieces (so their seams are found again).
     pub keep_planes: Vec<Plane>,
-    /// Receives the best Triangle layout (as cut lines) while searching.
-    pub preview: Option<triangle::PreviewFn>,
+    /// Receives the cut lines while splitting.
+    pub preview: Option<PreviewFn>,
 }
 
 pub struct SplitOutput {
     pub partition: Partition,
-    pub edit_status: Vec<EditStatus>,
+    pub stats: refine::RefineStats,
 }
 
 pub fn orient_params(s: &Settings) -> OrientParams {
@@ -68,15 +84,12 @@ pub fn orient_pieces(p: &mut Partition, ids: &[PieceId], params: &OrientParams) 
     }
 }
 
-/// Flags pieces that cannot slide straight into place during assembly.
-pub fn flag_assembly(p: &mut Partition) {
-    let a = crate::assembly::plan(p);
-    for q in p.pieces.iter_mut() {
-        q.flags.retain(|f| *f != Flag::NoAssemblyPath);
-        if a.blocked.contains(&q.id) {
-            q.flags.push(Flag::NoAssemblyPath);
-        }
-    }
+/// Full check of the given pieces: orientation, printability, shape flags
+/// (sharp, thin) and cuts through no-cut zones (prepared coordinates).
+pub fn check_pieces(p: &mut Partition, ids: &[PieceId], s: &Settings, zones: &Zones) {
+    let q = quality::QualityParams::from_settings(s).with_zones(zones);
+    let r = quality::analyze(p, ids, &q);
+    quality::apply_reports(p, &r);
 }
 
 /// Numbers pieces bottom-up, row by row, starting at 1.
@@ -93,64 +106,47 @@ pub fn number_pieces(p: &mut Partition) {
     }
 }
 
-/// Builds the cut plan for the chosen mode.
-pub fn plan(mesh: &Mesh, s: &Settings, zones: &Zones, job: &JobCtx, preview: Option<&triangle::PreviewFn>) -> Plan {
-    let bed = s.printer.usable();
-    let cell = |a: usize| s.split.target_size.map_or(bed[a], |t| t.min(bed[a]));
-    match s.split.mode {
-        SplitMode::Grid => grid::plan(&mesh.bbox(), [cell(0), cell(1), cell(2)], zones),
-        SplitMode::Triangle => triangle::plan(mesh, s, zones, job, preview),
-    }
-}
-
-/// Adds a fourth cut to pieces that still do not fit, need support or are
-/// tall (Triangle mode), within a time budget.
-pub fn fix_flagged(part: &mut Partition, params: &OrientParams, budget: std::time::Duration, job: &JobCtx) -> usize {
-    let start = std::time::Instant::now();
-    let mut fixed = 0;
-    let mut tried: Vec<PieceId> = Vec::new();
-    loop {
-        if job.is_cancelled() || start.elapsed() > budget {
-            break;
-        }
-        // Worst first: too big, then most support, then tall.
-        let next = part
-            .pieces
-            .iter()
-            .filter(|q| !q.locked && !tried.contains(&q.id))
-            .filter_map(|q| {
-                let rank = q.flags.iter().map(|f| match f {
-                    Flag::TooBig => 3e9,
-                    Flag::NeedsSupport(a) => 1e6 + *a as f64,
-                    Flag::Tall => 1.0,
-                    _ => 0.0,
-                }).fold(0.0, f64::max);
-                (rank > 0.0).then_some((rank, q.id))
-            })
-            .max_by(|a, b| a.0.total_cmp(&b.0));
-        let Some((_, id)) = next else { break };
-        tried.push(id);
-        if let Some(plane) = fix::best_cut(part, id, params, job) {
-            if let Ok(ids) = part.split_piece(id, plane) {
-                orient_pieces(part, &ids, params);
-                let mut nb: Vec<PieceId> = ids.iter().flat_map(|i| part.neighbours(*i)).collect();
-                nb.sort_unstable();
-                nb.dedup();
-                orient_pieces(part, &nb, params);
-                fixed += 1;
+/// Cut lines where cut faces meet the surface, for previews.
+pub fn seam_lines(p: &Partition) -> Vec<[Vec3; 2]> {
+    p.pieces
+        .par_iter()
+        .flat_map_iter(|q| {
+            let cuts = quality::piece_cuts(p, q.id);
+            let cap = quality::cap_index(&q.mesh, &cuts);
+            let m = &q.mesh;
+            let mut out = Vec::new();
+            for (a, b, t1, t2) in m.edge_pairs() {
+                if (cap[t1 as usize] == u32::MAX) != (cap[t2 as usize] == u32::MAX) {
+                    out.push([m.verts[a as usize], m.verts[b as usize]]);
+                }
             }
-        }
-    }
-    fixed
+            out
+        })
+        .collect()
 }
 
 pub fn run(input: SplitInput, job: &JobCtx) -> Result<SplitOutput, String> {
+    let started = Instant::now();
     let s = &input.settings;
-    job.set_progress(0.02);
-    // Build the full-resolution solid while the (proxy-based) planning runs.
-    let (solid, plan) = rayon::join(|| Solid::from_mesh(&input.mesh), || {
+    let shatter = s.split.mode == SplitMode::Shatter;
+    // Build the full-resolution solid while the layout is planned.
+    enum Layout {
+        Grid(Plan),
+        Cells(Vec<shatter::Cell>),
+    }
+    let (solid, layout) = rayon::join(|| Solid::from_mesh(&input.mesh), || {
         job.set_stage("Planning cuts");
-        plan(&input.mesh, s, &input.zones, job, input.preview.as_ref())
+        if shatter {
+            let (cells, seeds, spacing) = shatter::layout(&input.mesh, s, &input.zones, job);
+            if let Some(pf) = &input.preview {
+                let proxy = crate::simplify::cluster(&input.mesh, 40_000);
+                pf(shatter::preview_lines(&proxy, &seeds, spacing), format!("{} cells", cells.len()));
+            }
+            Layout::Cells(cells)
+        } else {
+            let bb = input.mesh.bbox();
+            Layout::Grid(grid::plan(&bb, &grid::cuts(&bb, s)))
+        }
     });
     let mut solid = solid.map_err(|e| format!("model is not a valid solid: {e}"))?;
     if !input.keep.is_empty() {
@@ -160,80 +156,79 @@ pub fn run(input: SplitInput, job: &JobCtx) -> Result<SplitOutput, String> {
     }
     job.check().map_err(|e| e.to_string())?;
     job.set_stage("Cutting");
-    job.set_progress(0.4);
-    let leaves = bsp::apply(solid, &plan, job).map_err(|e| match e {
-        bsp::ApplyError::Cancelled => "cancelled".to_string(),
-        bsp::ApplyError::Geometry(g) => g.to_string(),
-    })?;
-    let mut bodies: Vec<Solid> = leaves.into_par_iter().flat_map_iter(|l| l.bodies()).filter(|b| b.volume() > 1e-3).collect();
+    let mut planes = Vec::new();
+    let regions: Vec<Solid> = match &layout {
+        Layout::Grid(plan) => {
+            plan.planes(&mut planes);
+            bsp::apply(solid, plan, job).map_err(|e| match e {
+                bsp::ApplyError::Cancelled => "cancelled".to_string(),
+                bsp::ApplyError::Geometry(g) => g.to_string(),
+            })?
+        }
+        Layout::Cells(cells) => {
+            for c in cells {
+                planes.extend(c.planes.iter().copied());
+            }
+            shatter::apply(solid, cells, job)?.into_iter().map(|x| x.1).collect()
+        }
+    };
+    let mut bodies: Vec<Solid> = regions.into_par_iter().flat_map_iter(|l| l.bodies()).filter(|b| b.volume() > 1e-3).collect();
     let n_new = bodies.len();
     bodies.extend(input.keep.iter().map(|k| (**k).clone()));
     let mut part = Partition::from_solids(bodies);
     for q in part.pieces.iter_mut().skip(n_new) {
         q.locked = true;
     }
-    let mut planes = Vec::new();
-    plan.planes(&mut planes);
     planes.extend_from_slice(&input.keep_planes);
+    let planes = crate::partition::dedup_planes(planes.into_iter());
     job.set_stage("Finding seams");
-    job.set_progress(0.6);
     part.rebuild_seams(&planes);
     job.check().map_err(|e| e.to_string())?;
-    job.set_stage("Merging slivers");
-    job.set_progress(0.7);
-    let params = orient_params(s);
-    let stuck = cleanup::merge_slivers(&mut part, s.split.min_piece as f64, &params, job).map_err(|e| e.to_string())?;
-    job.set_stage("Applying edits");
-    let (edit_status, _) = edits::replay(&mut part, &input.edits);
-    job.set_stage("Orienting pieces");
-    job.set_progress(0.85);
-    let all: Vec<PieceId> = part.pieces.iter().map(|q| q.id).collect();
-    orient_pieces(&mut part, &all, &params);
-    if s.split.mode == SplitMode::Triangle {
-        job.set_stage("Fixing pieces that need support");
-        let budget = std::time::Duration::from_secs_f32((s.split.time_limit * 0.15).clamp(1.0, 30.0));
-        if fix_flagged(&mut part, &params, budget, job) > 0 {
-            cleanup::merge_slivers(&mut part, s.split.min_piece as f64, &params, job).map_err(|e| e.to_string())?;
-        }
-        // Fold fragments (e.g. at the model's silhouette) into neighbours.
-        job.set_stage("Merging small pieces");
-        let bed = s.printer.usable();
-        let target = s.split.target_size.unwrap_or(bed[0].max(bed[1])) as f64;
-        cleanup::merge_undersized(&mut part, target, 0.55, &params, job).map_err(|e| e.to_string())?;
-    }
-    for id in stuck {
-        if let Some(q) = part.piece_mut(id) {
-            q.flags.push(Flag::Small);
-        }
-    }
-    number_pieces(&mut part);
-    flag_assembly(&mut part);
-    job.set_stage("Done");
-    job.set_progress(1.0);
-    Ok(SplitOutput { partition: part, edit_status })
-}
 
-/// Distinct cut planes of a plan.
-pub fn plan_planes(plan: &Plan) -> Vec<Plane> {
-    let mut v = Vec::new();
-    plan.planes(&mut v);
-    crate::partition::dedup_planes(v.into_iter())
+    let q = quality::QualityParams::from_settings(s).with_zones(&input.zones);
+    let stats = if shatter {
+        // Improve until every piece prints well (or time runs out).
+        let deadline = started + Duration::from_secs_f32(s.split.time_limit.max(1.0));
+        let last = std::sync::Mutex::new(None::<Instant>);
+        let preview = input.preview.clone();
+        let report = |p: &Partition, msg: &str| {
+            if let Some(pf) = &preview {
+                let mut l = last.lock().unwrap();
+                if l.is_none_or(|t| t.elapsed() > Duration::from_millis(1500)) {
+                    pf(seam_lines(p), msg.to_string());
+                    *l = Some(Instant::now());
+                }
+            }
+        };
+        refine::refine(&mut part, &q, &input.zones, deadline, job, &report)
+    } else {
+        // Grid pieces are only checked: the cuts stay where they were put.
+        job.set_stage("Checking pieces");
+        let all: Vec<PieceId> = part.pieces.iter().map(|x| x.id).collect();
+        let reports = quality::analyze(&part, &all, &q);
+        quality::apply_reports(&mut part, &reports);
+        refine::flag_small(&mut part, &q);
+        refine::RefineStats::default()
+    };
+    job.check().map_err(|e| e.to_string())?;
+    number_pieces(&mut part);
+    job.set_stage("Done");
+    Ok(SplitOutput { partition: part, stats })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mesh::shapes;
-    use crate::printers::Printer;
     use glam::Vec3;
 
     #[test]
     fn grid_split_fits_and_conserves_volume() {
         let mesh = Arc::new(shapes::uv_sphere(200.0, 48, 24));
         let mut settings = Settings::default();
-        settings.printer.printer = Printer::new("t", 180.0, 180.0, 180.0);
+        settings.printer.volume = [180.0, 180.0, 180.0];
         settings.split.mode = SplitMode::Grid;
-        let out = run(SplitInput { mesh: mesh.clone(), settings, zones: Zones::default(), edits: vec![], keep: vec![], keep_planes: vec![], preview: None }, &JobCtx::new()).unwrap();
+        let out = run(SplitInput { mesh: mesh.clone(), settings, zones: Zones::default(), keep: vec![], keep_planes: vec![], preview: None }, &JobCtx::new()).unwrap();
         let p = &out.partition;
         assert!(p.pieces.len() >= 8, "{}", p.pieces.len());
         let v: f64 = p.total_volume();

@@ -1,7 +1,7 @@
-//! Progress reporting and cooperative cancellation for long-running work.
+//! Stage reporting and cooperative cancellation for long-running work.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Shared between the UI and a background job. Cheap to clone.
 #[derive(Clone, Default)]
@@ -12,10 +12,7 @@ pub struct JobCtx {
 #[derive(Default)]
 struct Inner {
     cancel: AtomicBool,
-    /// Progress in 1/10000ths.
-    progress: AtomicU32,
     stage: std::sync::Mutex<String>,
-    timer: std::sync::Mutex<Option<(String, std::time::Instant)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,29 +39,10 @@ impl JobCtx {
     pub fn check(&self) -> Result<(), Cancelled> {
         if self.is_cancelled() { Err(Cancelled) } else { Ok(()) }
     }
-    pub fn set_progress(&self, fraction: f32) {
-        self.inner.progress.store((fraction.clamp(0.0, 1.0) * 10000.0) as u32, Ordering::Relaxed);
-    }
-    pub fn progress(&self) -> f32 {
-        self.inner.progress.load(Ordering::Relaxed) as f32 / 10000.0
-    }
     pub fn set_stage(&self, stage: impl Into<String>) {
-        let stage = stage.into();
-        if std::env::var_os("S3D_TIMING").is_some() {
-            let mut t = self.inner.timer.lock().unwrap();
-            let now = std::time::Instant::now();
-            if let Some((prev, at)) = t.take() {
-                eprintln!("[timing] {prev}: {:?}", now - at);
-            }
-            *t = Some((stage.clone(), now));
-        }
-        *self.inner.stage.lock().unwrap() = stage;
+        *self.inner.stage.lock().unwrap() = stage.into();
     }
     pub fn stage(&self) -> String {
         self.inner.stage.lock().unwrap().clone()
-    }
-    /// Maps sub-step progress `i/n` into the `[from, to]` range of the overall bar.
-    pub fn step(&self, from: f32, to: f32, i: usize, n: usize) {
-        self.set_progress(from + (to - from) * (i as f32 / n.max(1) as f32));
     }
 }

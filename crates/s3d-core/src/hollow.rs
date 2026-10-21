@@ -66,7 +66,6 @@ pub fn hollow(mesh: &Mesh, wall: f32, job: &JobCtx) -> Result<Mesh, HollowError>
             bvh.closest(c, iso + half_diag + h).is_some()
         })
         .collect();
-    job.set_progress(0.3);
     job.check()?;
     job.set_stage("Hollowing: building inner surface");
     let reach = iso + 2.0 * h;
@@ -88,20 +87,15 @@ pub fn hollow(mesh: &Mesh, wall: f32, job: &JobCtx) -> Result<Mesh, HollowError>
         }
     };
     let cavity = march::extract(origin, h, &active, field);
-    job.set_progress(0.8);
     job.check()?;
     if cavity.tris.is_empty() {
         return Err(HollowError::NothingToRemove);
     }
     job.set_stage("Hollowing: subtracting cavity");
-    if std::env::var_os("S3D_DEBUG_HOLLOW").is_some() {
-        eprintln!("cavity tris {} stats {:?}", cavity.tris.len(), crate::repair::edge_stats(&cavity));
-    }
     // A stray inside/outside sign can leave a tiny hole; close it if so.
     let cavity = if crate::repair::edge_stats(&cavity).is_closed_manifold() { cavity } else { crate::repair::repair(cavity, job)?.mesh };
     let cav = Solid::from_mesh(&cavity).map_err(|e| HollowError::Geometry(e.to_string()))?;
     let shell = outer.subtract(&cav).map_err(|e| HollowError::Geometry(e.to_string()))?;
-    job.set_progress(1.0);
     Ok(shell.to_mesh())
 }
 

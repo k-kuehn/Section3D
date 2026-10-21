@@ -2,9 +2,10 @@
 //!
 //! Candidates are the piece's cut faces plus its large flat convex-hull faces.
 //! Ranking, in order: fits the printer > least support area > not tall >
-//! least total overhang > largest bed contact.
+//! steadiest (height against bed contact) > least total overhang > largest
+//! bed contact.
 
-use glam::{DVec2, DVec3, Quat, Vec2, Vec3};
+use glam::{DVec2, DVec3, Quat, Vec3};
 use rayon::prelude::*;
 
 use crate::manifold::Solid;
@@ -16,6 +17,11 @@ use crate::partition::{Flag, Orientation};
 pub const SUPPORT_NOISE: f32 = 100.0;
 /// Faces this close to the bed rest on it (mm).
 const BED_TOL: f32 = 0.3;
+/// A piece is tall when it stands higher than this times the length of its
+/// bed contact: thin standing panels tip over or peel off the bed.
+pub const TALL_RATIO: f32 = 0.8;
+/// Pieces lower than this never count as tall (mm).
+pub const TALL_MIN_HEIGHT: f32 = 40.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct OrientParams {
@@ -33,14 +39,34 @@ pub struct Eval {
     pub overhang: f32,
     pub contact: f32,
     pub size: Vec3,
+    /// Height over the longest span of the bed contact.
+    pub ratio: f32,
 }
 
+/// Bed contact below this is a piece balancing on points or a line (mm²).
+const MIN_CONTACT: f32 = 20.0;
+
 impl Eval {
-    /// Lexicographic ranking key (smaller is better).
-    fn key(&self) -> (u8, f32, u8, f32, f32) {
+    /// Lexicographic ranking key (smaller is better). Small overhangs count
+    /// as none for the first comparison, but between otherwise equal poses
+    /// the one resting flat with less overhang wins.
+    fn key(&self) -> (u8, f32, u8, u8, f32, f32, f32, f32) {
         let support = if self.support < SUPPORT_NOISE { 0.0 } else { (self.support / 10.0).round() };
-        (!self.fits as u8, support, self.tall as u8, self.overhang, -self.contact)
+        let rocks = self.contact < MIN_CONTACT;
+        (!self.fits as u8, support, self.tall as u8, rocks as u8, (self.support / 25.0).round(), (self.ratio.min(4.0) * 8.0).round(), self.overhang, -self.contact)
     }
+}
+
+/// Longest distance between two points of a small 2D point set (via its hull).
+fn diameter(pts: Vec<DVec2>) -> f64 {
+    let h = hull2d(pts);
+    let mut d = 0.0f64;
+    for i in 0..h.len() {
+        for j in i + 1..h.len() {
+            d = d.max(h[i].distance(h[j]));
+        }
+    }
+    d
 }
 
 /// Rotation that puts a face with outward normal `down` on the bed.
@@ -48,15 +74,24 @@ pub fn rest_on(down: DVec3) -> Quat {
     Quat::from_rotation_arc(down.as_vec3().normalize(), -Vec3::Z)
 }
 
-/// Area-weighted downward normals of the hull's large flat faces.
-fn hull_faces(mesh: &Mesh, limit: usize) -> Vec<DVec3> {
+/// Convex hull of a piece: its vertices (all extreme points, enough for
+/// footprints, heights and bed contact) and its largest flat faces.
+struct Hull {
+    pts: Vec<Vec3>,
+    faces: Vec<DVec3>,
+}
+
+fn hull_of(mesh: &Mesh, limit: usize) -> Hull {
     // Hull of the points: works for open meshes too (merge estimates).
     let step = (mesh.verts.len() / 20_000).max(1);
     let pts: Vec<DVec3> = mesh.verts.iter().step_by(step).map(|v| v.as_dvec3()).collect();
     let hull = match Solid::hull_points(&pts) {
         Ok(h) => h.to_mesh(),
-        Err(_) => return Vec::new(),
+        Err(_) => return Hull { pts: mesh.verts.clone(), faces: Vec::new() },
     };
+    if hull.verts.len() < 4 {
+        return Hull { pts: mesh.verts.clone(), faces: Vec::new() };
+    }
     // Group hull triangles by normal.
     let mut groups: Vec<(DVec3, f64)> = Vec::new();
     for t in 0..hull.tris.len() {
@@ -72,11 +107,11 @@ fn hull_faces(mesh: &Mesh, limit: usize) -> Vec<DVec3> {
         }
     }
     groups.sort_by(|a, b| b.1.total_cmp(&a.1));
-    groups.into_iter().take(limit).map(|g| g.0).collect()
+    Hull { pts: hull.verts, faces: groups.into_iter().take(limit).map(|g| g.0).collect() }
 }
 
-/// 2D convex hull (Andrew's monotone chain).
-fn hull2d(mut pts: Vec<DVec2>) -> Vec<DVec2> {
+/// 2D convex hull (Andrew's monotone chain), counter-clockwise.
+pub fn hull2d(mut pts: Vec<DVec2>) -> Vec<DVec2> {
     pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
     pts.dedup();
     if pts.len() < 3 {
@@ -146,8 +181,12 @@ pub fn fit_yaw(foot: &[DVec2], bed: [f32; 3]) -> (f64, f64, f64) {
 
 /// Evaluates the piece resting with outward normal `down` on the bed.
 pub fn evaluate(mesh: &Mesh, down: DVec3, p: &OrientParams) -> (Eval, Orientation) {
+    evaluate_with(mesh, &hull_of(mesh, 0).pts, down, p)
+}
+
+fn evaluate_with(mesh: &Mesh, hull: &[Vec3], down: DVec3, p: &OrientParams) -> (Eval, Orientation) {
     let q0 = rest_on(down);
-    let rotated: Vec<Vec3> = mesh.verts.iter().map(|v| q0 * *v).collect();
+    let rotated: Vec<Vec3> = hull.iter().map(|v| q0 * *v).collect();
     let zmin = rotated.iter().map(|v| v.z).fold(f32::INFINITY, f32::min);
     let foot: Vec<DVec2> = rotated.iter().map(|v| DVec2::new(v.x as f64, v.y as f64)).collect();
     let (yaw, w, d) = fit_yaw(&foot, p.bed);
@@ -156,16 +195,17 @@ pub fn evaluate(mesh: &Mesh, down: DVec3, p: &OrientParams) -> (Eval, Orientatio
     let height = zmax - zmin;
     let sin_lim = p.overhang_deg.to_radians().sin();
     let (mut support, mut overhang, mut contact) = (0f32, 0f32, 0f32);
+    let zs: Vec<f32> = mesh.verts.iter().map(|v| (q0 * *v).z).collect();
     for t in 0..mesh.tris.len() {
-        let [a, b, c] = mesh.tris[t].map(|i| rotated[i as usize]);
-        let cr = (b - a).cross(c - a);
+        let [a, b, c] = mesh.tris[t].map(|i| zs[i as usize]);
+        let cr = q0 * mesh.tri_cross(t);
         let area = cr.length() * 0.5;
         if area < 1e-12 {
             continue;
         }
         let nz = cr.z / (2.0 * area);
-        let low = a.z.min(b.z).min(c.z) - zmin;
-        if nz < -0.999 && low < BED_TOL && a.z.max(b.z).max(c.z) - zmin < BED_TOL {
+        let low = a.min(b).min(c) - zmin;
+        if nz < -0.999 && low < BED_TOL && a.max(b).max(c) - zmin < BED_TOL {
             contact += area;
             continue;
         }
@@ -178,15 +218,20 @@ pub fn evaluate(mesh: &Mesh, down: DVec3, p: &OrientParams) -> (Eval, Orientatio
     }
     let size = Vec3::new(w as f32, d as f32, height);
     let fits = size.x <= p.bed[0] + 1e-3 && size.y <= p.bed[1] + 1e-3 && size.z <= p.bed[2] + 1e-3;
-    let tall = height > size.x.max(size.y) * 1.05;
+    // Bed contact: points resting on the bed (works for faces, edges and
+    // the rims of standing shells alike); they are all hull points.
+    let base: Vec<DVec2> = rotated.iter().filter(|v| v.z - zmin < BED_TOL).map(|v| DVec2::new(v.x as f64, v.y as f64)).collect();
+    let span = diameter(base) as f32;
+    let ratio = height / span.max(1.0);
+    let tall = height > TALL_MIN_HEIGHT && ratio > TALL_RATIO;
     // Centre footprint on the bed origin with min z = 0.
-    let rv: Vec<Vec3> = mesh.verts.iter().map(|v| q * *v).collect();
+    let rv: Vec<Vec3> = hull.iter().map(|v| q * *v).collect();
     let lo = rv.iter().fold(Vec3::INFINITY, |a, v| a.min(*v));
     let hi = rv.iter().fold(Vec3::NEG_INFINITY, |a, v| a.max(*v));
     let c = (lo + hi) * 0.5;
     let translation = Vec3::new(-c.x, -c.y, -lo.z);
     (
-        Eval { fits, support, tall, overhang, contact, size },
+        Eval { fits, support, tall, overhang, contact, size, ratio },
         Orientation { rotation: q, translation, size, support_area: support },
     )
 }
@@ -194,8 +239,15 @@ pub fn evaluate(mesh: &Mesh, down: DVec3, p: &OrientParams) -> (Eval, Orientatio
 /// Chooses the best orientation. `cut_normals` are outward normals of the
 /// piece's cut faces. Returns the orientation and any flags it implies.
 pub fn best(mesh: &Mesh, cut_normals: &[DVec3], p: &OrientParams) -> (Orientation, Vec<Flag>) {
+    let (_, o, f) = best_eval(mesh, cut_normals, p);
+    (o, f)
+}
+
+/// Like `best`, also returning the evaluation of the chosen pose.
+pub fn best_eval(mesh: &Mesh, cut_normals: &[DVec3], p: &OrientParams) -> (Eval, Orientation, Vec<Flag>) {
+    let hull = hull_of(mesh, 10);
     let mut cands: Vec<DVec3> = cut_normals.to_vec();
-    cands.extend(hull_faces(mesh, 10));
+    cands.extend(hull.faces.iter().copied());
     let mut uniq: Vec<DVec3> = Vec::new();
     for c in cands {
         if !uniq.iter().any(|u| u.dot(c) > 0.9999) {
@@ -205,7 +257,7 @@ pub fn best(mesh: &Mesh, cut_normals: &[DVec3], p: &OrientParams) -> (Orientatio
     if uniq.is_empty() {
         uniq.push(-DVec3::Z);
     }
-    let evals: Vec<(Eval, Orientation)> = uniq.par_iter().map(|d| evaluate(mesh, *d, p)).collect();
+    let evals: Vec<(Eval, Orientation)> = uniq.par_iter().map(|d| evaluate_with(mesh, &hull.pts, *d, p)).collect();
     let (e, o) = evals.into_iter().min_by(|a, b| a.0.key().partial_cmp(&b.0.key()).unwrap_or(std::cmp::Ordering::Equal)).unwrap();
     let mut flags = Vec::new();
     if !e.fits {
@@ -217,26 +269,7 @@ pub fn best(mesh: &Mesh, cut_normals: &[DVec3], p: &OrientParams) -> (Orientatio
     if e.tall {
         flags.push(Flag::Tall);
     }
-    (o, flags)
-}
-
-/// Faces of `mesh` needing support in orientation `o` (for display).
-pub fn support_mask(mesh: &Mesh, o: &Orientation, overhang_deg: f32) -> Vec<bool> {
-    let sin_lim = overhang_deg.to_radians().sin();
-    let m = o.matrix();
-    let v: Vec<Vec3> = mesh.verts.iter().map(|p| m.transform_point3(*p)).collect();
-    mesh.tris
-        .iter()
-        .map(|t| {
-            let [a, b, c] = t.map(|i| v[i as usize]);
-            let n = (b - a).cross(c - a).normalize_or_zero();
-            n.z < -sin_lim && a.z.min(b.z).min(c.z) > BED_TOL * 0.5
-        })
-        .collect()
-}
-
-pub fn footprint_vec2(pts: &[Vec3]) -> Vec<Vec2> {
-    pts.iter().map(|p| Vec2::new(p.x, p.y)).collect()
+    (e, o, flags)
 }
 
 #[cfg(test)]
@@ -262,6 +295,19 @@ mod tests {
         let m = shapes::cube(Vec3::new(250.0, 20.0, 10.0));
         let (o, flags) = best(&m, &[], &params());
         assert!(!flags.contains(&Flag::TooBig), "{:?} {flags:?}", o.size);
+    }
+
+    #[test]
+    fn flat_face_beats_a_slightly_overhanging_pose() {
+        // A wedge: on its slanted face it stands lower and wider, but a
+        // little overhangs; on its square end it rests flat with none.
+        let s = Solid::cube(DVec3::new(120.0, 30.0, 40.0), false).unwrap();
+        let cut = s.split_by_plane(DVec3::new(0.25, 0.0, 1.0).normalize(), 40.0).unwrap().1;
+        let m = cut.to_mesh();
+        let (o, _) = best(&m, &[], &params());
+        let (e, _) = evaluate(&m, (o.rotation.inverse() * -Vec3::Z).as_dvec3(), &params());
+        assert!(e.contact >= MIN_CONTACT, "{e:?}");
+        assert!(e.support < 1.0, "{e:?}");
     }
 
     #[test]
